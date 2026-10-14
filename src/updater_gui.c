@@ -584,6 +584,168 @@ static void stamp_chrome_aumid(const WCHAR* exe) {
   CoUninitialize();
 }
 
+// ---- crash-safe .lnk writes ----
+//
+// IPersistFile::Save() rewrites the whole shortcut in place. If that stream is
+// cut short (process torn down mid-call, sharing violation, disk error) the file
+// is left at whatever length was reached — in the worst case 0 bytes. A 0-byte
+// .lnk is not merely stale: IPersistFile::Load() fails on it forever, so
+// patch_lnk_dir can never repair it and the user keeps a taskbar icon that looks
+// fine but does nothing. Snapshot before, verify after, roll back on damage.
+#define CG_MIN_VALID_LNK 76  // ShellLinkHeader is 76 bytes
+#define CG_LNK_BAK_CAP 65536
+
+static unsigned char g_lnk_bak[CG_LNK_BAK_CAP];
+
+static unsigned long cg_file_size(const WCHAR* p) {
+  WIN32_FILE_ATTRIBUTE_DATA fad;
+  if (!GetFileAttributesExW(p, GetFileExInfoStandard, &fad)) return 0;
+  return fad.nFileSizeLow;
+}
+
+static void wcat2(WCHAR* dst, int cap, const WCHAR* s) {
+  int n = wlen(dst);
+  int i = 0;
+  while (s[i] && n + i + 1 < cap) {
+    dst[n + i] = s[i];
+    i++;
+  }
+  dst[n + i] = 0;
+}
+
+static unsigned long cg_read_all(const WCHAR* p, unsigned char* buf,
+                                 unsigned long cap) {
+  HANDLE h = CreateFileW(p, GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return 0;
+  DWORD got = 0;
+  unsigned long total = 0;
+  while (total < cap &&
+         ReadFile(h, buf + total, cap - total, &got, NULL) && got > 0)
+    total += got;
+  CloseHandle(h);
+  return total;
+}
+
+static int cg_write_all(const WCHAR* p, const unsigned char* buf,
+                        unsigned long len) {
+  HANDLE h = CreateFileW(p, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return 0;
+  DWORD put = 0;
+  const BOOL ok = WriteFile(h, buf, len, &put, NULL);
+  CloseHandle(h);
+  return ok && put == len;
+}
+
+// Swap `buf` in for the .lnk's current bytes via a sibling temp file, so the
+// shortcut is never observable at an intermediate length.
+static int cg_replace_bytes(const WCHAR* p, const unsigned char* buf,
+                            unsigned long len) {
+  WCHAR tmp[720];
+  wcpy(tmp, p);
+  wcat2(tmp, 720, L".cgtmp");
+  if (!cg_write_all(tmp, buf, len)) {
+    DeleteFileW(tmp);
+    return 0;
+  }
+  if (!ReplaceFileW(p, tmp, NULL, REPLACEFILE_IGNORE_MERGE_ERRORS, NULL, NULL)) {
+    DeleteFileW(tmp);
+    return 0;
+  }
+  return 1;
+}
+
+// Save through IPersistFile, then treat the on-disk result as untrusted.
+// Returns 1 only when the file is still a structurally valid shell link.
+static int cg_safe_lnk_save(CG_IPersistFile* pf, const WCHAR* lnk) {
+  const unsigned long before_len = cg_file_size(lnk);
+  const unsigned long backed =
+      (before_len > 0 && before_len <= CG_LNK_BAK_CAP)
+          ? cg_read_all(lnk, g_lnk_bak, CG_LNK_BAK_CAP)
+          : 0;
+
+  pf->lpVtbl->Save(pf, NULL, TRUE);
+  const unsigned long after = cg_file_size(lnk);
+  if (after >= CG_MIN_VALID_LNK) return 1;
+
+  // The save corrupted the shortcut. Restore the pre-save bytes so the pin
+  // keeps working; the next update retries the stamp.
+  if (backed == before_len && cg_replace_bytes(lnk, g_lnk_bak, backed)) return 0;
+  // Nothing usable to roll back to — drop the husk so Explorer stops showing a
+  // dead pin and the user can re-pin cleanly.
+  if (!backed) DeleteFileW(lnk);
+  return 0;
+}
+
+// Read just the target path out of an existing .lnk. Returns 1 on success.
+static int cg_lnk_target(const WCHAR* lnk, WCHAR* out, int cap) {
+  CG_IPersistFile* pf = NULL;
+  if (FAILED(CoCreateInstance(&CG_CLSID_ShellLink, NULL, CLSCTX_ALL,
+                              &CG_IID_IPersistFile, (void**)&pf)) ||
+      !pf)
+    return 0;
+  CG_IShellLinkW* sl = NULL;
+  HRESULT hr = pf->lpVtbl->Load(pf, lnk, STGM_READ);
+  if (SUCCEEDED(hr))
+    hr = pf->lpVtbl->QueryInterface(pf, &CG_IID_IShellLinkW, (void**)&sl);
+  int ok = 0;
+  if (SUCCEEDED(hr) && sl) {
+    out[0] = 0;
+    sl->lpVtbl->GetPath(sl, out, cap, NULL, 0);
+    ok = out[0] != 0;
+  }
+  if (sl) sl->lpVtbl->Release(sl);
+  pf->lpVtbl->Release(pf);
+  return ok;
+}
+
+// A .lnk truncated by an earlier failed save can never be Load()ed, so
+// patch_lnk_dir skips it on every subsequent run and the pin stays dead forever.
+// Rebuild it from a sibling shortcut that still points at `exe`.
+#define CG_MAX_HUSKS 8
+
+static void cg_heal_truncated(const WCHAR* dir, const WCHAR* exe) {
+  WCHAR pattern[700];
+  pjoin(pattern, 700, dir, L"*.lnk");
+  WIN32_FIND_DATAW fd;
+  HANDLE h = FindFirstFileW(pattern, &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+
+  WCHAR husk[CG_MAX_HUSKS][700];
+  int nhusk = 0;
+  WCHAR donor[700];
+  donor[0] = 0;
+
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    WCHAR lnk[700];
+    pjoin(lnk, 700, dir, fd.cFileName);
+    if (fd.nFileSizeLow < CG_MIN_VALID_LNK) {
+      if (nhusk < CG_MAX_HUSKS) wcpy(husk[nhusk++], lnk);
+      continue;
+    }
+    if (!donor[0]) {
+      WCHAR t[600];
+      if (cg_lnk_target(lnk, t, 600) && wncmpI(t, exe, wlen(exe)) == 0)
+        wcpy(donor, lnk);
+    }
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+
+  if (!nhusk || !donor[0]) return;
+
+  static unsigned char buf[CG_LNK_BAK_CAP];
+  const unsigned long len = cg_read_all(donor, buf, CG_LNK_BAK_CAP);
+  if (len < CG_MIN_VALID_LNK) return;
+
+  for (int i = 0; i < nhusk; i++) {
+    if (cg_write_all(husk[i], buf, len))
+      SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, husk[i], NULL);
+  }
+}
+
 // Scan one directory for .lnk files pointing at `exe` and stamp them with
 // `aumid`. Returns number of shortcuts patched. COM must already be initialized.
 static int patch_lnk_dir(const WCHAR* dir, const WCHAR* exe, const WCHAR* aumid) {
@@ -626,8 +788,10 @@ static int patch_lnk_dir(const WCHAR* dir, const WCHAR* exe, const WCHAR* aumid)
         ps->lpVtbl->Release(ps);
         // CRITICAL: IPersistFile::Save flushes the change to disk. Without this,
         // Commit() only mutates the in-memory object and the .lnk keeps its old AUMID.
+        // cg_safe_lnk_save additionally verifies what landed and rolls back a
+        // damaged write, so a failed flush cannot leave the pin at 0 bytes.
         if (SUCCEEDED(hr)) {
-          pf->lpVtbl->Save(pf, NULL, TRUE);
+          cg_safe_lnk_save(pf, lnk);
           SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, lnk, NULL);
           fixed++;
         }
@@ -652,6 +816,9 @@ static void patch_pinned_lnk_aumid(const WCHAR* exe, const WCHAR* aumid) {
     WCHAR dir[700];
     pjoin(dir, 700, appdata,
           L"Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar");
+    // Heal anything a previous failed save left behind FIRST: a 0-byte .lnk
+    // fails Load() and would otherwise be skipped by the stamp pass below.
+    cg_heal_truncated(dir, exe);
     patch_lnk_dir(dir, exe, aumid);
   }
   // Alternate location used by some Windows builds / Start menu pins.
@@ -659,6 +826,7 @@ static void patch_pinned_lnk_aumid(const WCHAR* exe, const WCHAR* aumid) {
     WCHAR dir[700];
     pjoin(dir, 700, appdata,
           L"Microsoft\\Windows\\Application Shortcuts");
+    cg_heal_truncated(dir, exe);
     patch_lnk_dir(dir, exe, aumid);
   }
   // (Silent: 0 patched just means no matching .lnk found — normal if user

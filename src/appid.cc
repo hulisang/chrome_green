@@ -1112,6 +1112,197 @@ static void CleanStaleChromeJumpLists(const std::wstring& exe) {
                 std::to_string(removed));
 }
 
+// ---------------------------------------------------------------------------
+// Crash-safe .lnk writes.
+//
+// IPersistFile::Save() rewrites the whole shortcut in place: it opens the
+// target with CREATE_ALWAYS and streams the new contents out. If that stream is
+// cut short — process torn down mid-call, sharing violation, disk error — the
+// file is left at whatever length was reached, in the worst case 0 bytes. A
+// 0-byte .lnk is not merely stale: IPersistFile::Load() fails on it forever, so
+// PatchLnkDir can never repair it and the user is left with a taskbar icon that
+// looks fine but does nothing.
+//
+// Snapshot the bytes before saving, then verify what actually landed. Anything
+// below a structurally valid shell link is rolled back, which keeps a working
+// pin (just without our AUMID) instead of destroying it.
+static const DWORD kMinValidLnkSize = 76;  // ShellLinkHeader is 76 bytes
+
+static DWORD FileSizeOf(const std::wstring& path) {
+  WIN32_FILE_ATTRIBUTE_DATA fad = {0};
+  if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return 0;
+  return fad.nFileSizeLow;
+}
+
+static bool ReadAllBytes(const std::wstring& path, std::string* out) {
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  LARGE_INTEGER sz = {};
+  if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (16 << 20)) {
+    CloseHandle(h);
+    return false;
+  }
+  out->resize(static_cast<size_t>(sz.QuadPart));
+  DWORD got = 0;
+  const BOOL ok = ReadFile(h, &(*out)[0], static_cast<DWORD>(out->size()), &got,
+                           nullptr);
+  CloseHandle(h);
+  if (!ok || got != out->size()) {
+    out->clear();
+    return false;
+  }
+  return true;
+}
+
+static bool WriteAllBytes(const std::wstring& path, const std::string& data) {
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  DWORD put = 0;
+  const BOOL ok =
+      WriteFile(h, data.data(), static_cast<DWORD>(data.size()), &put, nullptr);
+  CloseHandle(h);
+  return ok && put == data.size();
+}
+
+// Swap `data` in for the .lnk's current bytes via a sibling temp file, so the
+// shortcut is never observable at an intermediate length.
+static bool ReplaceLnkBytes(const std::wstring& path, const std::string& data) {
+  std::wstring tmp = path + L".cgtmp";
+  if (!WriteAllBytes(tmp, data)) {
+    DeleteFileW(tmp.c_str());
+    return false;
+  }
+  if (!ReplaceFileW(path.c_str(), tmp.c_str(), nullptr,
+                    REPLACEFILE_IGNORE_MERGE_ERRORS, nullptr, nullptr)) {
+    DeleteFileW(tmp.c_str());
+    return false;
+  }
+  return true;
+}
+
+// Save through IPersistFile, then treat the on-disk result as untrusted.
+// Returns true only when the file is still a structurally valid shell link.
+static bool SafeShellLinkSave(IPersistFile* pf, const std::wstring& lnk_path) {
+  std::string before;
+  const bool had_before = ReadAllBytes(lnk_path, &before);
+
+  const HRESULT hr = pf->Save(nullptr, TRUE);
+  const DWORD size_after = FileSizeOf(lnk_path);
+
+  if (SUCCEEDED(hr) && size_after >= kMinValidLnkSize) {
+    AddDebugLog("appid: FixPinnedShortcut save_hr=0 bytes=" +
+                std::to_string(size_after));
+    return true;
+  }
+
+  AddDebugLog("appid: FixPinnedShortcut save_hr=" +
+              std::to_string(static_cast<long>(hr)) +
+              " left " + std::to_string(size_after) + " bytes");
+
+  // The save corrupted the shortcut. Restore the pre-save bytes so the pin
+  // keeps working; the next launch retries the stamp.
+  if (had_before && ReplaceLnkBytes(lnk_path, before)) {
+    AddDebugLog("appid: rolled back pinned lnk to " +
+                std::to_string(before.size()) + " bytes");
+  } else if (!had_before) {
+    // Nothing to roll back to — drop the husk so Explorer stops showing a dead
+    // pin and the user can re-pin cleanly.
+    DeleteFileW(lnk_path.c_str());
+  }
+  return false;
+}
+
+// Read just the target path out of an existing .lnk.
+static bool ReadLnkTargetExe(const std::wstring& lnk_path, std::wstring* out) {
+  IPersistFile* pf = nullptr;
+  HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_ALL,
+                                IID_IPersistFile, (void**)&pf);
+  if (FAILED(hr) || !pf) return false;
+  IShellLinkW* sl = nullptr;
+  hr = pf->Load(lnk_path.c_str(), STGM_READ);
+  if (SUCCEEDED(hr)) hr = pf->QueryInterface(IID_IShellLinkW, (void**)&sl);
+  bool ok = false;
+  if (SUCCEEDED(hr) && sl) {
+    wchar_t target[MAX_PATH] = {0};
+    sl->GetPath(target, MAX_PATH, nullptr, 0);
+    if (target[0]) {
+      *out = target;
+      ok = true;
+    }
+  }
+  if (sl) sl->Release();
+  pf->Release();
+  return ok;
+}
+
+// Collect .lnk files under `dir` that still point at `exe` and are big enough
+// to be real shell links — i.e. usable donors for rebuilding a truncated one.
+static void CollectLnkDonors(const std::wstring& dir, const std::wstring& exe,
+                             std::vector<std::wstring>* out) {
+  WIN32_FIND_DATAW fd = {0};
+  HANDLE h = FindFirstFileW((dir + L"\\*.lnk").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    if (fd.nFileSizeLow < kMinValidLnkSize) continue;
+    std::wstring p = dir + L"\\" + fd.cFileName;
+    std::wstring t;
+    if (ReadLnkTargetExe(p, &t) && _wcsicmp(t.c_str(), exe.c_str()) == 0)
+      out->push_back(p);
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+}
+
+// A .lnk truncated by an earlier failed save can never be Load()ed, so
+// PatchLnkDir skips it on every subsequent run and the pin stays dead forever.
+// Rebuild it from a sibling (or desktop) shortcut that still points at `exe`;
+// the normal stamp pass then lands on the fresh file.
+static int HealTruncatedLnks(const std::wstring& dir, const std::wstring& exe) {
+  std::vector<std::wstring> broken;
+  WIN32_FIND_DATAW fd = {0};
+  HANDLE h = FindFirstFileW((dir + L"\\*.lnk").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return 0;
+  do {
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    if (fd.nFileSizeLow < kMinValidLnkSize)
+      broken.push_back(dir + L"\\" + fd.cFileName);
+  } while (FindNextFileW(h, &fd));
+  FindClose(h);
+  if (broken.empty()) return 0;
+
+  std::vector<std::wstring> donors;
+  CollectLnkDonors(dir, exe, &donors);
+  if (donors.empty()) {
+    // The user's Desktop is commonly redirected off the profile, so resolve it
+    // through the shell rather than assuming %USERPROFILE%\Desktop.
+    wchar_t desk[MAX_PATH] = {0};
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr,
+                                   SHGFP_TYPE_CURRENT, desk)))
+      CollectLnkDonors(desk, exe, &donors);
+  }
+  if (donors.empty()) {
+    AddDebugLog("appid: truncated pinned lnk with no donor, skipped=" +
+                std::to_string(broken.size()));
+    return 0;
+  }
+
+  std::string bytes;
+  if (!ReadAllBytes(donors[0], &bytes)) return 0;
+
+  int healed = 0;
+  for (const auto& b : broken) {
+    if (WriteAllBytes(b, bytes)) {
+      healed++;
+      SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, b.c_str(), nullptr);
+    }
+  }
+  AddDebugLog("appid: rebuilt truncated pinned lnk=" + std::to_string(healed));
+  return healed;
+}
+
 // Scan one taskbar-pin folder for .lnk files whose target is `exe` and stamp
 // them with `aumid`; returns the number patched.
 static int PatchLnkDir(const std::wstring& dir, const std::wstring& exe,
@@ -1153,11 +1344,9 @@ static int PatchLnkDir(const std::wstring& dir, const std::wstring& exe,
         if (SUCCEEDED(hr)) hr = ps->Commit();
         ps->Release();
         // Commit() only mutates the in-memory object; Save() flushes to disk.
-        if (SUCCEEDED(hr)) {
-          hr = pf->Save(nullptr, TRUE);
-          AddDebugLog("appid: FixPinnedShortcut save_hr=" +
-                      std::to_string(static_cast<long>(hr)));
-        }
+        // SafeShellLinkSave verifies what landed and rolls back a bad write, so
+        // a failed flush can no longer leave the pin at 0 bytes.
+        if (SUCCEEDED(hr)) hr = SafeShellLinkSave(pf, lnk_path) ? S_OK : E_FAIL;
         // Let Explorer re-read this .lnk so it picks up the new AUMID.
         // Synchronous so the refresh is not lost.
         SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, lnk_path.c_str(), nullptr);
@@ -1200,6 +1389,9 @@ static void FixPinnedShortcutAumid(const std::wstring& exe,
 
   int total = 0;
   for (const auto& dir : candidates) {
+    // Heal anything a previous failed save left behind FIRST: a 0-byte .lnk
+    // fails Load() and would otherwise be skipped by the stamp pass below.
+    HealTruncatedLnks(dir, exe);
     total += PatchLnkDir(dir, exe, aumid);
   }
 
