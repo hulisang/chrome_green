@@ -475,6 +475,9 @@ void __stdcall SHChangeNotify(long event, unsigned long flags,
 #ifndef SHCNF_PATH
 #define SHCNF_PATH 0x1
 #endif
+#ifndef SHCNF_FLUSH
+#define SHCNF_FLUSH 0x1000
+#endif
 
 // ---- minimal COM interfaces for .lnk patching (no-CRT, no shobjidl.h) ----
 
@@ -679,71 +682,112 @@ static int cg_safe_lnk_save(CG_IPersistFile* pf, const WCHAR* lnk) {
   return 0;
 }
 
-// Read just the target path out of an existing .lnk. Returns 1 on success.
-static int cg_lnk_target(const WCHAR* lnk, WCHAR* out, int cap) {
+// A shortcut damaged by an earlier failed save is skipped by patch_lnk_dir on
+// every later run (0 bytes Load()s but reports no target; a partial one fails
+// Load() outright), so the pin stays dead forever. Rebuild it from `exe` — NOT
+// from a sibling donor .lnk: the donor route needed some OTHER shortcut to
+// still point at chrome.exe, so it did nothing for exactly the user it was
+// meant to save. Returns the number of husks rebuilt.
+#define CG_MAX_HUSKS 8
+
+// Serialize a fresh shortcut targeting `exe` into `buf`. Returns the length, or
+// 0 on failure. Writes only to a scratch file in the system temp dir.
+static unsigned long cg_build_lnk(const WCHAR* exe, unsigned char* buf,
+                                  unsigned long cap) {
   CG_IPersistFile* pf = NULL;
   if (FAILED(CoCreateInstance(&CG_CLSID_ShellLink, NULL, CLSCTX_ALL,
                               &CG_IID_IPersistFile, (void**)&pf)) ||
       !pf)
     return 0;
+  unsigned long len = 0;
   CG_IShellLinkW* sl = NULL;
-  HRESULT hr = pf->lpVtbl->Load(pf, lnk, STGM_READ);
-  if (SUCCEEDED(hr))
-    hr = pf->lpVtbl->QueryInterface(pf, &CG_IID_IShellLinkW, (void**)&sl);
-  int ok = 0;
-  if (SUCCEEDED(hr) && sl) {
-    out[0] = 0;
-    sl->lpVtbl->GetPath(sl, out, cap, NULL, 0);
-    ok = out[0] != 0;
+  if (SUCCEEDED(pf->lpVtbl->QueryInterface(pf, &CG_IID_IShellLinkW, (void**)&sl)) &&
+      sl) {
+    sl->lpVtbl->SetPath(sl, exe);
+    // Working directory = the exe's own folder.
+    WCHAR wd[700];
+    int n = 0;
+    while (n < 699 && exe[n]) { wd[n] = exe[n]; n++; }
+    wd[n] = 0;
+    while (n > 0 && wd[n - 1] != L'\\') wd[--n] = 0;
+    if (n > 1) wd[n - 1] = 0;
+    sl->lpVtbl->SetWorkingDirectory(sl, wd);
+    sl->lpVtbl->SetIconLocation(sl, exe, 0);
+
+    WCHAR tmp[700];
+    if (GetTempPathW(300, tmp)) {
+      WCHAR name[64];
+      wsprintfW(name, L"cgrebuilt_%lu.cgtmp", GetCurrentProcessId());
+      wcat2(tmp, 700, name);
+      if (SUCCEEDED(pf->lpVtbl->Save(pf, tmp, TRUE)))
+        len = cg_read_all(tmp, buf, cap);
+      DeleteFileW(tmp);
+    }
+    sl->lpVtbl->Release(sl);
   }
-  if (sl) sl->lpVtbl->Release(sl);
   pf->lpVtbl->Release(pf);
-  return ok;
+  return len >= CG_MIN_VALID_LNK ? len : 0;
 }
 
-// A .lnk truncated by an earlier failed save can never be Load()ed, so
-// patch_lnk_dir skips it on every subsequent run and the pin stays dead forever.
-// Rebuild it from a sibling shortcut that still points at `exe`.
-#define CG_MAX_HUSKS 8
+// Case-insensitive substring search (no-CRT stand-in for StrStrIW).
+static int containsI(const WCHAR* hay, const WCHAR* needle) {
+  if (!needle[0]) return 0;
+  const int nl = wlen(needle);
+  for (const WCHAR* p = hay; *p; p++) {
+    if (wncmpI(p, needle, nl) == 0) return 1;
+  }
+  return 0;
+}
 
-static void cg_heal_truncated(const WCHAR* dir, const WCHAR* exe) {
+static int cg_heal_truncated(const WCHAR* dir, const WCHAR* exe) {
+  // A damaged file has no target to match on, so identify it by name: the
+  // exe's stem ("chrome") must appear in the shortcut's name. Without this a
+  // husk belonging to ANY other pinned app would be rebuilt as a Chrome
+  // shortcut. A renamed pin that does not mention the browser is left alone.
+  WCHAR stem[600];
+  {
+    const WCHAR* base = exe;
+    for (const WCHAR* p = exe; *p; p++)
+      if (*p == L'\\') base = p + 1;
+    int n = 0;
+    while (n < 599 && base[n] && base[n] != L'.') { stem[n] = base[n]; n++; }
+    stem[n] = 0;
+    if (!n) return 0;
+  }
+
   WCHAR pattern[700];
   pjoin(pattern, 700, dir, L"*.lnk");
   WIN32_FIND_DATAW fd;
   HANDLE h = FindFirstFileW(pattern, &fd);
-  if (h == INVALID_HANDLE_VALUE) return;
+  if (h == INVALID_HANDLE_VALUE) return 0;
 
   WCHAR husk[CG_MAX_HUSKS][700];
   int nhusk = 0;
-  WCHAR donor[700];
-  donor[0] = 0;
 
   do {
     if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+    if (fd.nFileSizeLow >= CG_MIN_VALID_LNK) continue;
+    if (!containsI(fd.cFileName, stem)) continue;
     WCHAR lnk[700];
     pjoin(lnk, 700, dir, fd.cFileName);
-    if (fd.nFileSizeLow < CG_MIN_VALID_LNK) {
-      if (nhusk < CG_MAX_HUSKS) wcpy(husk[nhusk++], lnk);
-      continue;
-    }
-    if (!donor[0]) {
-      WCHAR t[600];
-      if (cg_lnk_target(lnk, t, 600) && wncmpI(t, exe, wlen(exe)) == 0)
-        wcpy(donor, lnk);
-    }
+    if (nhusk < CG_MAX_HUSKS) wcpy(husk[nhusk++], lnk);
   } while (FindNextFileW(h, &fd));
   FindClose(h);
 
-  if (!nhusk || !donor[0]) return;
+  if (!nhusk) return 0;
 
   static unsigned char buf[CG_LNK_BAK_CAP];
-  const unsigned long len = cg_read_all(donor, buf, CG_LNK_BAK_CAP);
-  if (len < CG_MIN_VALID_LNK) return;
+  const unsigned long len = cg_build_lnk(exe, buf, CG_LNK_BAK_CAP);
+  if (len < CG_MIN_VALID_LNK) return 0;
 
+  int healed = 0;
   for (int i = 0; i < nhusk; i++) {
-    if (cg_write_all(husk[i], buf, len))
-      SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, husk[i], NULL);
+    if (cg_write_all(husk[i], buf, len)) {
+      healed++;
+      SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH | SHCNF_FLUSH, husk[i], NULL);
+    }
   }
+  return healed;
 }
 
 // Scan one directory for .lnk files pointing at `exe` and stamp them with
@@ -779,6 +823,25 @@ static int patch_lnk_dir(const WCHAR* dir, const WCHAR* exe, const WCHAR* aumid)
       CG_IPropertyStore* ps = NULL;
       hr = sl->lpVtbl->QueryInterface(sl, &CG_IID_IPropertyStore, (void**)&ps);
       if (SUCCEEDED(hr) && ps) {
+        // Read-before-write: skip a shortcut that already carries this AUMID.
+        // An unconditional Save() rewrites the whole .lnk on every update —
+        // wasted work, and one more window where an interrupted Save() can
+        // truncate the pin.
+        struct { unsigned short vt; unsigned short r1, r2, r3; void* p; } cur;
+        memset(&cur, 0, sizeof(cur));
+        int already = 0;
+        if (SUCCEEDED(ps->lpVtbl->GetValue(ps, &CG_PKEY_AppUserModel_ID, &cur))) {
+          if (cur.vt == VT_LPWSTR && cur.p &&
+              wncmpI((const WCHAR*)cur.p, aumid, wlen(aumid)) == 0 &&
+              ((const WCHAR*)cur.p)[wlen(aumid)] == 0)
+            already = 1;
+        }
+        if (already) {
+          ps->lpVtbl->Release(ps);
+          sl->lpVtbl->Release(sl);
+          pf->lpVtbl->Release(pf);
+          continue;
+        }
         struct { unsigned short vt; unsigned short r1, r2, r3; void* p; } pv;
         memset(&pv, 0, sizeof(pv));
         pv.vt = VT_LPWSTR;
@@ -792,7 +855,10 @@ static int patch_lnk_dir(const WCHAR* dir, const WCHAR* exe, const WCHAR* aumid)
         // damaged write, so a failed flush cannot leave the pin at 0 bytes.
         if (SUCCEEDED(hr)) {
           cg_safe_lnk_save(pf, lnk);
-          SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, lnk, NULL);
+          // FLUSH: wait for Explorer to re-read the shortcut so the refreshed
+          // menu is visible the moment we are done, not whenever the posted
+          // notification happens to be processed.
+          SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH | SHCNF_FLUSH, lnk, NULL);
           fixed++;
         }
       }

@@ -2,6 +2,7 @@
 
 #include <propidl.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <shobjidl.h>
 #include <windows.h>
 
@@ -691,6 +692,9 @@ void WINAPI MySHAddToRecentDocs(UINT uFlags, LPCVOID pv) {
 // recently-closed tabs through SHAddToRecentDocs, so we read History directly
 // on a timer). RegisterTasks is self-contained (CoInit/CoUninit +
 // BeginList/CommitList under g_reg_cs).
+static void FixPinnedShortcutAumid(const std::wstring& exe,
+                                   const std::wstring& aumid);
+
 static DWORD WINAPI RecentFlushThread(LPVOID) {
   for (;;) {
     Sleep(45000);  // refresh every 45s
@@ -699,6 +703,14 @@ static DWORD WINAPI RecentFlushThread(LPVOID) {
     std::wstring aid = g_resolved_aumid;
     LeaveCriticalSection(&g_aumid_cs);
     if (!aid.empty()) {
+      // Revisit the pinned shortcut on the same timer. Nothing else ever
+      // touches that file after startup, so a .lnk damaged mid-session stayed
+      // dead until the next launch — which is what makes a heal feel slow.
+      // The read-before-write check in PatchLnkDir keeps this a cheap no-op
+      // whenever the pin is already healthy.
+      CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+      FixPinnedShortcutAumid(GetSelfDllDir() + L"\\chrome.exe", aid);
+      CoUninitialize();
       if (config.IsFixTaskbarMenu()) {
         RegisterTasks(aid);
       } else {
@@ -1118,10 +1130,14 @@ static void CleanStaleChromeJumpLists(const std::wstring& exe) {
 // IPersistFile::Save() rewrites the whole shortcut in place: it opens the
 // target with CREATE_ALWAYS and streams the new contents out. If that stream is
 // cut short — process torn down mid-call, sharing violation, disk error — the
-// file is left at whatever length was reached, in the worst case 0 bytes. A
-// 0-byte .lnk is not merely stale: IPersistFile::Load() fails on it forever, so
-// PatchLnkDir can never repair it and the user is left with a taskbar icon that
-// looks fine but does nothing.
+// file is left at whatever length was reached, in the worst case 0 bytes.
+//
+// A damaged .lnk is worse than merely stale. Measured on Windows 11 (26200):
+//   * 0 bytes      -> Load() returns S_OK, but GetPath() reports no target
+//                     (S_FALSE), so _wcsicmp("") never matches our exe;
+//   * 1..75 bytes  -> Load() fails outright (E_FAIL/E_UNEXPECTED).
+// Either way PatchLnkDir skips the file on every subsequent run, so nothing
+// rewrites it and the pin stays dead forever.
 //
 // Snapshot the bytes before saving, then verify what actually landed. Anything
 // below a structurally valid shell link is rolled back, which keeps a working
@@ -1183,6 +1199,17 @@ static bool ReplaceLnkBytes(const std::wstring& path, const std::string& data) {
   return true;
 }
 
+// Tell the shell a .lnk changed, and WAIT for the refresh. The plain
+// SHCNE_UPDATEITEM is posted asynchronously, so the old AUMID can stay visible
+// in the taskbar context menu for a while after we have already finished
+// writing — which is what makes a correct heal look slow. SHCNF_FLUSH is
+// synchronous and measured at ~0.6 ms here (vs ~1.0 ms posted), so forcing the
+// done-with-it signal costs nothing and removes the lag entirely.
+static void NotifyLnkChanged(const std::wstring& lnk) {
+  SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH | SHCNF_FLUSH, lnk.c_str(),
+                 nullptr);
+}
+
 // Save through IPersistFile, then treat the on-disk result as untrusted.
 // Returns true only when the file is still a structurally valid shell link.
 static bool SafeShellLinkSave(IPersistFile* pf, const std::wstring& lnk_path) {
@@ -1215,88 +1242,96 @@ static bool SafeShellLinkSave(IPersistFile* pf, const std::wstring& lnk_path) {
   return false;
 }
 
-// Read just the target path out of an existing .lnk.
-static bool ReadLnkTargetExe(const std::wstring& lnk_path, std::wstring* out) {
+// Serialize a fresh shortcut targeting `exe` into bytes, without touching any
+// existing file. Letting the shell build the link (instead of hand-assembling a
+// ShellLinkHeader) keeps our output byte-identical to what Explorer and the
+// updater produce, including the LinkInfo and StringData blocks that make the
+// pinned item launch correctly.
+static std::string MakeLnkBytesFor(const std::wstring& exe) {
+  std::string out;
   IPersistFile* pf = nullptr;
   HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_ALL,
                                 IID_IPersistFile, (void**)&pf);
-  if (FAILED(hr) || !pf) return false;
+  if (FAILED(hr) || !pf) return out;
   IShellLinkW* sl = nullptr;
-  hr = pf->Load(lnk_path.c_str(), STGM_READ);
-  if (SUCCEEDED(hr)) hr = pf->QueryInterface(IID_IShellLinkW, (void**)&sl);
-  bool ok = false;
+  hr = pf->QueryInterface(IID_IShellLinkW, (void**)&sl);
   if (SUCCEEDED(hr) && sl) {
-    wchar_t target[MAX_PATH] = {0};
-    sl->GetPath(target, MAX_PATH, nullptr, 0);
-    if (target[0]) {
-      *out = target;
-      ok = true;
+    sl->SetPath(exe.c_str());
+    std::wstring wd = exe;
+    const size_t slash = wd.find_last_of(L'\\');
+    if (slash != std::wstring::npos) wd.resize(slash);
+    sl->SetWorkingDirectory(wd.c_str());
+    sl->SetIconLocation(exe.c_str(), 0);
+
+    // Save to a scratch file in the system temp dir (NOT next to the exe, and
+    // NOT the target), read the bytes back, drop the scratch. Nothing outside
+    // temp is touched, so a failure here cannot damage an existing pin. The PID
+    // in the name keeps two Chrome processes healing at once from colliding.
+    wchar_t tmpdir[MAX_PATH] = {0};
+    if (GetTempPathW(MAX_PATH, tmpdir)) {
+      wchar_t name[64];
+      swprintf(name, 64, L"cgrebuilt_%lu.cgtmp", GetCurrentProcessId());
+      std::wstring tmp = std::wstring(tmpdir) + name;
+      if (SUCCEEDED(pf->Save(tmp.c_str(), TRUE))) ReadAllBytes(tmp, &out);
+      DeleteFileW(tmp.c_str());
     }
+    sl->Release();
   }
-  if (sl) sl->Release();
   pf->Release();
-  return ok;
+  return out;
 }
 
-// Collect .lnk files under `dir` that still point at `exe` and are big enough
-// to be real shell links — i.e. usable donors for rebuilding a truncated one.
-static void CollectLnkDonors(const std::wstring& dir, const std::wstring& exe,
-                             std::vector<std::wstring>* out) {
-  WIN32_FIND_DATAW fd = {0};
-  HANDLE h = FindFirstFileW((dir + L"\\*.lnk").c_str(), &fd);
-  if (h == INVALID_HANDLE_VALUE) return;
-  do {
-    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-    if (fd.nFileSizeLow < kMinValidLnkSize) continue;
-    std::wstring p = dir + L"\\" + fd.cFileName;
-    std::wstring t;
-    if (ReadLnkTargetExe(p, &t) && _wcsicmp(t.c_str(), exe.c_str()) == 0)
-      out->push_back(p);
-  } while (FindNextFileW(h, &fd));
-  FindClose(h);
-}
-
-// A .lnk truncated by an earlier failed save can never be Load()ed, so
-// PatchLnkDir skips it on every subsequent run and the pin stays dead forever.
-// Rebuild it from a sibling (or desktop) shortcut that still points at `exe`;
-// the normal stamp pass then lands on the fresh file.
+// A shortcut damaged by an earlier failed save is skipped by PatchLnkDir on
+// every subsequent run (a 0-byte file Load()s but reports no target; a partial
+// one fails Load() outright), so the pin stays dead forever. Rebuild it — but
+// from the exe path we already hold, NOT from a donor shortcut. The old donor
+// route needed some OTHER .lnk to still point at chrome.exe, so it silently did
+// nothing for exactly the user it was meant to save. The stamp pass below then
+// lands on the fresh file.
 static int HealTruncatedLnks(const std::wstring& dir, const std::wstring& exe) {
+  // A damaged file carries no target to match on, so identify it by name: the
+  // exe's stem ("chrome") must appear in the shortcut's name ("Google
+  // Chrome.lnk"). Without this a husk belonging to ANY other pinned app (Edge,
+  // Explorer) would be silently rebuilt as a Chrome shortcut. A renamed pin
+  // that does not mention the browser is deliberately left alone — better to
+  // miss one than to hijack someone else's pin.
+  std::wstring stem = exe;
+  const size_t slash = stem.find_last_of(L'\\');
+  if (slash != std::wstring::npos) stem.erase(0, slash + 1);
+  const size_t dot = stem.find_last_of(L'.');
+  if (dot != std::wstring::npos) stem.erase(dot);
+  if (stem.empty()) return 0;
+
   std::vector<std::wstring> broken;
   WIN32_FIND_DATAW fd = {0};
   HANDLE h = FindFirstFileW((dir + L"\\*.lnk").c_str(), &fd);
   if (h == INVALID_HANDLE_VALUE) return 0;
   do {
     if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-    if (fd.nFileSizeLow < kMinValidLnkSize)
-      broken.push_back(dir + L"\\" + fd.cFileName);
+    if (fd.nFileSizeLow >= kMinValidLnkSize) continue;
+    if (StrStrIW(fd.cFileName, stem.c_str()) == nullptr) continue;
+    broken.push_back(dir + L"\\" + fd.cFileName);
   } while (FindNextFileW(h, &fd));
   FindClose(h);
   if (broken.empty()) return 0;
 
-  std::vector<std::wstring> donors;
-  CollectLnkDonors(dir, exe, &donors);
-  if (donors.empty()) {
-    // The user's Desktop is commonly redirected off the profile, so resolve it
-    // through the shell rather than assuming %USERPROFILE%\Desktop.
-    wchar_t desk[MAX_PATH] = {0};
-    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_DESKTOPDIRECTORY, nullptr,
-                                   SHGFP_TYPE_CURRENT, desk)))
-      CollectLnkDonors(desk, exe, &donors);
-  }
-  if (donors.empty()) {
-    AddDebugLog("appid: truncated pinned lnk with no donor, skipped=" +
+  // Rebuild the shortcut from `exe` rather than hunting for a donor .lnk. The
+  // donor route was the slow part: it depended on some OTHER shortcut still
+  // pointing at chrome.exe, so a user whose only shortcut was the pin — or
+  // whose Desktop the shell refuses to resolve — waited forever for a heal
+  // that could never run. Everything needed is already known here.
+  std::string bytes = MakeLnkBytesFor(exe);
+  if (bytes.size() < kMinValidLnkSize) {
+    AddDebugLog("appid: truncated pinned lnk, rebuild failed, skipped=" +
                 std::to_string(broken.size()));
     return 0;
   }
-
-  std::string bytes;
-  if (!ReadAllBytes(donors[0], &bytes)) return 0;
 
   int healed = 0;
   for (const auto& b : broken) {
     if (WriteAllBytes(b, bytes)) {
       healed++;
-      SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, b.c_str(), nullptr);
+      NotifyLnkChanged(b);
     }
   }
   AddDebugLog("appid: rebuilt truncated pinned lnk=" + std::to_string(healed));
@@ -1336,6 +1371,26 @@ static int PatchLnkDir(const std::wstring& dir, const std::wstring& exe,
       IPropertyStore* ps = nullptr;
       hr = sl->QueryInterface(IID_IPropertyStore, (void**)&ps);
       if (SUCCEEDED(hr) && ps) {
+        // Read-before-write: a pin that already carries the AUMID needs no
+        // rewrite at all. Skipping is what keeps the common path fast — an
+        // unconditional Save() re-marshals the whole shortcut to disk on EVERY
+        // Chrome launch, which is both pointless work and a fresh window in
+        // which Save() can be interrupted and truncate the .lnk.
+        PROPVARIANT cur;
+        ZeroMemory(&cur, sizeof(cur));
+        bool already = false;
+        if (SUCCEEDED(ps->GetValue(PKEY_AppUserModel_ID, &cur))) {
+          already = (cur.vt == VT_LPWSTR && cur.pwszVal &&
+                     _wcsicmp(cur.pwszVal, aumid.c_str()) == 0);
+        }
+        PropVariantClear(&cur);
+        if (already) {
+          ps->Release();
+          AddDebugLog("appid: pinned lnk already stamped, skipped");
+          sl->Release();
+          pf->Release();
+          continue;
+        }
         PROPVARIANT pv;
         ZeroMemory(&pv, sizeof(pv));
         pv.vt = VT_LPWSTR;
@@ -1347,9 +1402,9 @@ static int PatchLnkDir(const std::wstring& dir, const std::wstring& exe,
         // SafeShellLinkSave verifies what landed and rolls back a bad write, so
         // a failed flush can no longer leave the pin at 0 bytes.
         if (SUCCEEDED(hr)) hr = SafeShellLinkSave(pf, lnk_path) ? S_OK : E_FAIL;
-        // Let Explorer re-read this .lnk so it picks up the new AUMID.
-        // Synchronous so the refresh is not lost.
-        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATH, lnk_path.c_str(), nullptr);
+        // Let Explorer re-read this .lnk so it picks up the new AUMID, and wait
+        // for the refresh so the new menu is visible immediately.
+        NotifyLnkChanged(lnk_path);
         if (SUCCEEDED(hr)) fixed++;
       }
     }
