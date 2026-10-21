@@ -1,0 +1,179 @@
+name: Fix Build (upstream sync + x64)
+
+# Keeps this fork's fix branch on top of upstream and builds the patched
+# version.dll whenever upstream moves.
+#
+# A fork does NOT receive push events for its upstream, so "upstream updated"
+# has to be polled: the `schedule` trigger below does that. GitHub only runs
+# scheduled workflows from the repository's DEFAULT branch, which is why this
+# file must also exist on `main`. The `push` trigger covers direct pushes to
+# the fix branch (the file must exist there too, hence the copy).
+#
+# Everything happens inside one run: sync merges upstream into the fix branch
+# and pushes it, then build checks that branch out. No PAT is needed and no
+# cross-workflow dispatch (a GITHUB_TOKEN push cannot start another workflow).
+on:
+  schedule:
+    # Poll upstream a few times a day; offset minutes to avoid the top of hour.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      rebuild_without_sync:
+        description: "Skip the upstream merge and just rebuild the current fix branch"
+        type: boolean
+        default: false
+  push:
+    branches: [fix/lnk-zero-byte]
+    paths-ignore:
+      - "web/**"
+      - "**.md"
+
+permissions:
+  contents: write # sync pushes the merge commit into the fix branch
+
+concurrency:
+  group: fix-build
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- 1. sync
+  # Only does work when running from the default branch (schedule / dispatch).
+  # A push to the fix branch is already up to date by definition.
+  sync:
+    if: >-
+      ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+          && github.event.inputs.rebuild_without_sync != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for a real merge)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream main into the fix branch when behind
+        env:
+          UPSTREAM: libsgh/chrome_green
+          TARGET: fix/lnk-zero-byte
+        run: |
+          set -euo pipefail
+          git config user.name  "chrome-green-fix-bot"
+          git config user.email "chrome-green-fix-bot@users.noreply.github.com"
+          git fetch --no-tags origin "+refs/heads/${TARGET}:refs/remotes/origin/${TARGET}"
+          git fetch --no-tags "https://github.com/${UPSTREAM}.git" \
+            "+refs/heads/main:refs/remotes/upstream/main"
+
+          UP=$(git rev-parse refs/remotes/upstream/main)
+          TIP=$(git rev-parse "refs/remotes/origin/${TARGET}")
+          echo "upstream main : $UP"
+          echo "fix branch tip: $TIP"
+
+          if git merge-base --is-ancestor "$UP" "$TIP"; then
+            echo "::notice::fix branch already contains upstream main; nothing to merge"
+            exit 0
+          fi
+
+          git checkout -B "$TARGET" "$TIP"
+          if ! git merge --no-ff --no-edit \
+               -m "chore(sync): merge ${UPSTREAM} main@${UP:0:7} into ${TARGET}" "$UP"; then
+            echo "::error::Merge conflict against upstream ${UP:0:7} — the fix needs a manual rebase (src/appid.cc / src/updater_gui.c)."
+            git merge --abort
+            exit 1
+          fi
+
+          # The patch must survive the merge. If upstream ever ships its own
+          # equivalent the merge still succeeds (same file, different lines);
+          # this only catches the case where the fix silently disappeared.
+          if ! grep -q 'SafeShellLinkSave' src/appid.cc || \
+             ! grep -q 'cg_safe_lnk_save'  src/updater_gui.c; then
+            echo "::error::the .lnk fix is missing after the merge"
+            exit 1
+          fi
+
+          git push origin "HEAD:refs/heads/${TARGET}"
+
+  # --------------------------------------------------------------- 2. build
+  # Runs after sync (or on a push to the fix branch, where sync is skipped).
+  # x64 only: the arch the local UCRT64 build was verified against. Add more
+  # entries to the matrix for x86/arm64.
+  build:
+    needs: [sync]
+    if: ${{ always() && (needs.sync.result == 'success' || needs.sync.result == 'skipped') }}
+    runs-on: windows-2025
+    steps:
+      - name: Checkout fix branch (latest, including a merge just pushed)
+        uses: actions/checkout@v7
+        with:
+          ref: fix/lnk-zero-byte
+          submodules: "true"
+          fetch-depth: 0
+
+      - name: Report what is being built
+        shell: bash
+        run: |
+          echo "commit : $(git rev-parse --short HEAD)"
+          echo "subject: $(git log -1 --pretty=%s)"
+          grep -E '#define RELEASE_VER' src/version.h
+          echo "fix markers appid  : $(grep -c 'SafeShellLinkSave\|HealTruncatedLnks' src/appid.cc)"
+          echo "fix markers updater: $(grep -c 'cg_safe_lnk_save\|cg_heal_truncated' src/updater_gui.c)"
+          echo "SRC_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
+      - name: Build Web Frontend
+        shell: bash
+        run: cd web && npm ci && npm run build && cd ..
+
+      - name: Embed Web Content
+        shell: bash
+        run: node scripts/embed.mjs
+
+      - name: Set CLANG_BIN
+        shell: bash
+        run: echo "CLANG_BIN=$(dirname "$(where clang-cl | head -n 1)")" >> $GITHUB_ENV
+
+      - name: Setup Xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: "3.1.0"
+
+      - name: Configure Xmake
+        run: xmake f -m release -a x64 --toolchain=clang-cl --bin="${{ env.CLANG_BIN }}" --yes
+
+      - name: Build (updater exe first, then version.dll)
+        shell: bash
+        run: |
+          # version.dll embeds chrome_green_updater.exe as RCDATA 1001 via
+          # src/updater_res.rc, which the exe target's after_build rewrites.
+          # On a clean checkout the dll must not be linked before the exe.
+          xmake build -r chrome_green_updater
+          xmake
+
+      - name: Verify the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          DLL="build/release/version.dll"
+          test -f "$DLL" || { echo "::error::version.dll missing"; exit 1; }
+          echo "version.dll = $(stat -c%s "$DLL") bytes"
+
+          EXPORTS=$(llvm-readobj --coff-exports "$DLL" | grep -c 'Name: ' || true)
+          echo "exports = $EXPORTS"
+          test "$EXPORTS" -eq 18 || { echo "::error::expected 18 exports, got $EXPORTS"; exit 1; }
+
+          # The heal routines are static, so assert on their log strings.
+          grep -aq 'appid: rebuilt truncated pinned lnk=' "$DLL" \
+            || { echo "::error::donor-less heal string missing from the DLL"; exit 1; }
+          grep -aq 'appid: pinned lnk already stamped, skipped' "$DLL" \
+            || { echo "::error::read-before-write skip missing from the DLL"; exit 1; }
+
+          cp "$DLL" "version-x64-${SRC_SHA}.dll"
+
+      - name: Upload version.dll
+        uses: actions/upload-artifact@v7
+        with:
+          name: version-x64-${{ env.SRC_SHA }}
+          path: version-x64-${{ env.SRC_SHA }}.dll
+          if-no-files-found: error
