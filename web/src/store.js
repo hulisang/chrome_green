@@ -57,6 +57,7 @@ const settings = reactive({
   proxy_type: "HTTP",
   proxy_chrome_download: false,
   download_source: 1,
+  self_update_channel: 1,
   theme: "auto",
   language: "auto",
   // general (portable / launch / hotkeys)
@@ -72,6 +73,8 @@ const settings = reactive({
   open_new_window: "",
   open_url_group: "",
   url_group: "",
+  open_clipboard: "",
+  clipboard_mode: 0,
   win32k: false,
   ignore_policies: false,
   suppress_false_upgrade_notification: false,
@@ -81,7 +84,7 @@ const settings = reactive({
   open_config_after_update: false,
   fix_taskbar_menu: true,
   // tabs (ported from chrome_plus tabbookmark)
-  keep_last_tab: true,
+  keep_last_tab: 1,
   double_click_close: true,
   right_click_close: false,
   wheel_tab: true,
@@ -151,7 +154,7 @@ const activeTab = ref("status");
 const allTabs = [
   { id: "status", label: "nav_status", icon: "status" },
   { id: "settings", label: "nav_settings", icon: "settings" },
-  { id: "proxy", label: "nav_proxy", icon: "network" },
+  { id: "hotkeys", label: "nav_hotkeys", icon: "keyboard" },
   { id: "resolver", label: "nav_resolver", icon: "dns" },
   { id: "tabs", label: "nav_tabs", icon: "tabs" },
   { id: "logs", label: "nav_logs", icon: "logs" },
@@ -212,6 +215,13 @@ const proxyTypeOptions = computed(() => [
   { value: "HTTP", label: "HTTP" },
   { value: "SOCKS5", label: "SOCKS5" },
   { value: "GH_PROXY", label: "GH_PROXY" },
+]);
+// Source for ChromeGreen's own version.dll updates. GH_PROXY does not apply
+// to the Gitee option.
+const selfUpdateChannelOptions = computed(() => [
+  { value: 0, label: "GitHub" },
+  { value: 1, label: "Gitee" },
+  { value: 2, label: "CNB" },
 ]);
 let logPollTimer = null;
 const logPollingInterval = 5000;
@@ -483,11 +493,14 @@ async function saveSettings(forceRecheck = false) {
     await api.updateConfig(settings);
     await refreshConfig();
     await refreshStatus();
-    // When channel or download_source changes, reset state and re-check
+    // When channel / download_source / self_update_channel changes, reset state
+    // and re-check. Switching the ChromeGreen source also re-runs the
+    // self-update check so the new channel takes effect right away.
     if (recheck) {
       await api.resetUpdate();
       await refreshStatus();
       await checkUpdate();
+      await checkSelfUpdate();
     }
     showToast(t("save_success"), "success");
   } catch (e) {
@@ -956,6 +969,7 @@ export function useStore() {
     channelOptions,
     checkIntervalOptions,
     proxyTypeOptions,
+    selfUpdateChannelOptions,
     version,
     githubUrl,
     themeClass,

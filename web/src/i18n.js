@@ -52,6 +52,9 @@ const translations = {
     download_source: "Download Source",
     download_source_desc:
       "Choose the CDN to download the Chrome installer from",
+    self_update_channel: "ChromeGreen Update Channel",
+    self_update_channel_desc:
+      "Where ChromeGreen checks for its own version.dll updates. GH_PROXY does not apply to Gitee/CNB.",
     channel_stable: "Stable",
     channel_beta: "Beta",
     channel_dev: "Dev",
@@ -68,7 +71,7 @@ const translations = {
     keep_old_versions: "Keep old versions",
     keep_old_versions_desc:
       "Keep previous Chrome version directories after updating",
-    proxy_settings: "Proxy Settings",
+    proxy_settings: "Update Proxy",
     proxy_settings_desc: "Configure proxy for update checks and downloads",
     proxy_type: "Proxy Type",
     proxy_type_desc:
@@ -129,9 +132,9 @@ const translations = {
     eta_sec: "s",
     eta_min: "m",
     eta_hour: "h",
-    nav_settings: "Settings",
+    nav_settings: "Update Settings",
     nav_self: "Self-Update",
-    nav_proxy: "Proxy",
+    nav_hotkeys: "Hotkeys",
     nav_logs: "Logs",
     nav_tools: "Tools",
     tools_title: "Tools",
@@ -196,8 +199,11 @@ const translations = {
     tabs_title: "Tab Enhancement",
     tabs_desc:
       "Double/right-click to close, wheel to switch, hover to activate, keep last tab, and more",
-    keep_last_tab: "Keep Last Tab",
-    keep_last_tab_desc: "Never close the last remaining tab",
+    keep_last_tab: "Close Last Tab Behavior",
+    keep_last_tab_desc: "What happens when you close the last remaining tab",
+    keep_last_tab_close: "Close browser window",
+    keep_last_tab_newtab: "Open a new tab",
+    keep_last_tab_ntp: "Close window if last tab is a new tab",
     double_click_close: "Double-click to Close",
     double_click_close_desc: "Double-click a tab to close it",
     right_click_close: "Right-click to Close",
@@ -222,12 +228,12 @@ const translations = {
     drag_link_new_tab: "Drop Links in New Tab",
     drag_link_new_tab_desc:
       "Dropping a link on the page opens it in a background tab and leaves the current page alone",
-    open_url_new_tab: "Open URL in New Tab",
+    open_url_new_tab: "Open URL on Enter",
     open_url_new_tab_desc:
-      "Address-bar Enter opens the URL in a new tab: Off / Alt+Enter / Shift+Alt+Enter",
-    open_bookmark_new_tab: "Open Bookmark in New Tab",
+      "How Enter in the address bar opens: Current tab / New tab (as Alt+Enter) / New tab (as Shift+Alt+Enter)",
+    open_bookmark_new_tab: "Open Bookmark on Left Click",
     open_bookmark_new_tab_desc:
-      "Bookmark opens in a new tab: Off / Middle+Shift click / Middle click",
+      "How a left-click on a bookmark opens: Current tab / New tab (as Middle+Shift) / New tab (as Middle)",
     new_tab_disable: "Disable on Named Tabs",
     new_tab_disable_desc:
       "Disable the new-tab enhancements (address bar, bookmarks, dropped links) on tabs whose title contains any of the names below",
@@ -277,6 +283,14 @@ const translations = {
     action_open_url_group_desc:
       "Batch-open the URL list below as new tabs with this hotkey",
     action_open_url_group_ph: "e.g. Ctrl+Shift+U",
+    action_open_clipboard: "Open Clipboard as Tabs",
+    action_open_clipboard_desc:
+      "Open the clipboard content as new tabs with this hotkey",
+    action_open_clipboard_ph: "e.g. Ctrl+Shift+C",
+    clipboard_mode_off: "Off",
+    clipboard_mode_links: "Extract links",
+    clipboard_mode_search: "Search as text",
+    clipboard_mode_both: "Links + search text",
     url_group_desc: "One URL per line, e.g. https://www.google.com",
     show_password: "Show Saved Passwords Without Reauth",
     show_password_desc:
@@ -300,6 +314,8 @@ const translations = {
     grp_privacy: "Privacy & Security",
     grp_advanced: "Key Mappings",
     grp_other: "Other",
+    grp_proxy: "Update Proxy",
+    hotkeys_desc: "Configure keyboard shortcuts for ChromeGreen",
     restart_required: "Requires restart",
     restart_note:
       "Items marked “Requires restart” only take effect after restarting Chrome.",
@@ -352,6 +368,9 @@ const translations = {
     target_arch_desc: "从运行进程自动检测",
     download_source: "下载通道",
     download_source_desc: "选择 Chrome 安装包的下载 CDN",
+    self_update_channel: "ChromeGreen 更新通道",
+    self_update_channel_desc:
+      "选择从哪里检查 ChromeGreen 自身（version.dll）更新。Gitee / CNB 通道下 GH_PROXY 代理不生效。",
     channel_stable: "稳定版",
     channel_beta: "测试版",
     channel_dev: "开发版",
@@ -366,7 +385,7 @@ const translations = {
     keep_installer_desc: "应用更新后保留下载的 Chrome 安装包",
     keep_old_versions: "保留历史版本",
     keep_old_versions_desc: "更新后保留之前的 Chrome 版本目录",
-    proxy_settings: "代理设置",
+    proxy_settings: "更新代理",
     proxy_settings_desc: "配置更新检查和下载的代理服务器",
     proxy_type: "代理类型",
     proxy_type_desc:
@@ -425,9 +444,9 @@ const translations = {
     eta_sec: "秒",
     eta_min: "分",
     eta_hour: "小时",
-    nav_settings: "设置",
+    nav_settings: "更新设置",
     nav_self: "自更新",
-    nav_proxy: "代理",
+    nav_hotkeys: "快捷键",
     nav_logs: "日志",
     nav_tools: "工具",
     tools_title: "工具",
@@ -490,8 +509,11 @@ const translations = {
     nav_tabs: "标签页增强",
     tabs_title: "标签页增强",
     tabs_desc: "双击/右键关闭、滚轮切换、悬停激活、保留最后一页等标签行为",
-    keep_last_tab: "保留最后一个标签",
-    keep_last_tab_desc: "永不关闭仅剩的最后一个标签",
+    keep_last_tab: "关闭最后一个标签时",
+    keep_last_tab_desc: "关闭仅剩的最后一个标签时的行为",
+    keep_last_tab_close: "关闭浏览器窗口",
+    keep_last_tab_newtab: "打开一个新标签",
+    keep_last_tab_ntp: "如果是新标签页，则关闭浏览器窗口",
     double_click_close: "双击关闭标签",
     double_click_close_desc: "双击标签将其关闭",
     right_click_close: "右键关闭标签",
@@ -514,12 +536,12 @@ const translations = {
     drag_link_new_tab: "拖拽链接开新标签",
     drag_link_new_tab_desc:
       "在页面内拖拽链接松开时，在后台新标签打开，当前页面保持不动",
-    open_url_new_tab: "地址栏回车新标签打开",
+    open_url_new_tab: "地址栏回车打开网址",
     open_url_new_tab_desc:
-      "地址栏回车在新标签打开网址：关闭 / Alt+Enter / Shift+Alt+Enter",
-    open_bookmark_new_tab: "书签新标签打开",
+      "普通回车打开网址的方式：当前页 / 新标签(伪装 Alt+Enter) / 新标签(伪装 Shift+Alt+Enter)",
+    open_bookmark_new_tab: "左键点击书签",
     open_bookmark_new_tab_desc:
-      "书签在新标签打开：关闭 / 中键+Shift 点击 / 中键点击",
+      "左键点击书签的打开方式：当前页 / 新标签(中键+Shift) / 新标签(中键)",
     new_tab_disable: "对指定标签禁用",
     new_tab_disable_desc: "对标题包含下列任一名称的标签禁用新标签增强（地址栏、书签、拖拽链接）",
     new_tab_disable_name: "排除的标签名称",
@@ -563,6 +585,14 @@ const translations = {
     action_open_url_group_desc:
       "按下快捷键后，按下方列表逐个在新标签页打开这些网址",
     action_open_url_group_ph: "例如 Ctrl+Shift+U",
+    action_open_clipboard: "从剪切板打开标签页",
+    action_open_clipboard_desc:
+      "按下快捷键后，把剪切板内容按下方方式在新标签页打开",
+    action_open_clipboard_ph: "例如 Ctrl+Shift+C",
+    clipboard_mode_off: "关闭",
+    clipboard_mode_links: "提取链接",
+    clipboard_mode_search: "文本搜索",
+    clipboard_mode_both: "链接 + 文本搜索",
     url_group_desc: "每行一个网址，例如 https://www.google.com",
     show_password: "免验证查看已保存密码",
     show_password_desc: "无需验证系统登录密码即可查看已保存的密码",
@@ -584,6 +614,8 @@ const translations = {
     grp_privacy: "隐私与安全",
     grp_advanced: "按键映射",
     grp_other: "其他",
+    grp_proxy: "更新代理",
+    hotkeys_desc: "配置 ChromeGreen 的快捷键",
     restart_required: "需重启",
     restart_note: "标注「需重启」的项，修改后需重启 Chrome 才能生效。",
   },

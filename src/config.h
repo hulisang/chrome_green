@@ -45,6 +45,12 @@ class Config {
   const std::wstring& GetOpenNewWindowHotkey() const { return open_new_window_; }
   const std::wstring& GetOpenUrlGroupHotkey() const { return open_url_group_; }
   const std::vector<std::wstring>& GetUrlGroup() const { return url_group_; }
+  // Opens clipboard content as new tabs: 0 off, 1 extract links, 2 search text,
+  // 3 links + search leftover text.
+  const std::wstring& GetOpenClipboardHotkey() const {
+    return open_clipboard_;
+  }
+  int GetClipboardMode() const { return clipboard_mode_; }
   bool IsShowPassword() const { return show_password_; }
   // Debug-log gate: when false, AddDebugLog() in update.cc is a no-op and the
   // config page hides the Logs tab. Defaults to false (off).
@@ -75,7 +81,8 @@ class Config {
   }
 
   // tabs (ported from chrome_plus tabbookmark)
-  bool IsKeepLastTab() const { return keep_last_tab_; }
+  int GetKeepLastTabMode() const { return keep_last_tab_mode_; }
+  bool IsKeepLastTabEnabled() const { return keep_last_tab_mode_ != 0; }
   bool IsDoubleClickClose() const { return double_click_close_; }
   bool IsRightClickClose() const { return right_click_close_; }
   bool IsWheelTab() const { return wheel_tab_; }
@@ -133,6 +140,18 @@ class Config {
   const std::string& GetUpdateProxyType() const { return update_proxy_type_; }
   bool ProxyChromeDownload() const { return proxy_chrome_download_; }
   int GetDownloadSource() const { return download_source_; }
+  // Where ChromeGreen's own version.dll updates come from:
+  // 0 = GitHub Releases, 1 = Gitee (default).
+  int GetSelfUpdateChannel() const { return self_update_channel_; }
+  // On update, close Chrome gracefully (WM_CLOSE to all browser windows, wait
+  // for a natural exit) before force-killing leftovers. ON by default.
+  bool IsGracefulClose() const { return graceful_close_; }
+  int GetGracefulCloseTimeout() const { return graceful_close_timeout_; }
+  // Relaunch after an update with --restore-last-session (restores the last
+  // session regardless of the "on startup" setting). ON by default.
+  bool IsRestoreSessionAfterUpdate() const {
+    return restore_session_after_update_;
+  }
   // Architecture is auto-detected from the system, not user-configurable
   static UpdateArch DetectArch();
 
@@ -194,6 +213,8 @@ class Config {
   std::wstring open_new_window_;
   std::wstring open_url_group_;
   std::vector<std::wstring> url_group_;
+  std::wstring open_clipboard_;
+  int clipboard_mode_ = 0;
   bool show_password_ = false;
   bool debug_log_ = false;
   bool suppress_cmdline_warning_ = false;
@@ -209,7 +230,7 @@ class Config {
   bool suppress_false_upgrade_notification_;
 
   // tabs (ported from chrome_plus tabbookmark)
-  bool keep_last_tab_ = false;
+  int keep_last_tab_mode_ = 1;
   bool double_click_close_ = false;
   bool right_click_close_ = false;
   bool wheel_tab_ = false;
@@ -246,6 +267,10 @@ class Config {
   std::string update_proxy_type_ = "HTTP";
   bool proxy_chrome_download_ = false;
   int download_source_ = 1;  // 0=edgedl, 1=dl.google.com (default), 2=www.google.com
+  int self_update_channel_ = 1;  // 0=GitHub, 1=Gitee (default), 2=CNB
+  bool graceful_close_ = true;
+  int graceful_close_timeout_ = 30;  // seconds, total budget
+  bool restore_session_after_update_ = true;
 };
 
 extern const Config& config;

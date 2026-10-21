@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <initializer_list>
 #include <optional>
 #include <string_view>
@@ -975,22 +976,13 @@ std::optional<TabHitResult> BuildTabHitResult(const UiaSession& session,
 std::optional<std::wstring> GetNewTabButtonName(
     const UiaSession& session,
     const ComPtr<IUIAutomationElement>& region) {
-  static std::optional<std::wstring> cached_name;
-  if (cached_name.has_value()) {
-    return cached_name;
-  }
-
   const auto button = FindFirstDescendantByClass(
       region, session.class_conditions.tab_strip_control_button);
   if (!button) {
     return std::nullopt;
   }
 
-  auto name = GetStringProperty(button, UIA_NamePropertyId);
-  if (name && !name->empty()) {
-    cached_name = name;
-  }
-  return cached_name;
+  return GetStringProperty(button, UIA_NamePropertyId);
 }
 
 ComPtr<IUIAutomationElement> FindBookmarkInAnchor(
@@ -1375,6 +1367,43 @@ bool IsOmniboxFocused() {
   return HasAnyClassName(focused, {L"OmniboxViewViews", L"OmniboxResultView"});
 }
 
+bool IsOmniboxEmptyOrDefault(HWND hwnd) {
+  const UiaSession* session = GetUiaSession();
+  if (!session) {
+    return false;
+  }
+
+  const auto root = GetElementFromWindow(*session, hwnd);
+  if (!root) {
+    return false;
+  }
+
+  ComPtr<IUIAutomationCondition> omnibox_condition;
+  if (!CreateClassCondition(session->automation, L"OmniboxViewViews",
+                            &omnibox_condition) ||
+      !omnibox_condition) {
+    return false;
+  }
+
+  const auto edit = FindFirstDescendantByClass(root, omnibox_condition);
+  if (!edit) {
+    return false;
+  }
+
+  const auto value = GetStringProperty(edit, UIA_ValueValuePropertyId);
+  if (!value) {
+    return false;
+  }
+
+  if (value->empty() || value->starts_with(L"chrome://newtab") ||
+      value->starts_with(L"chrome://new-tab-page") ||
+      value->find(L"搜索") != std::wstring::npos ||
+      value->find(L"Search") != std::wstring::npos) {
+    return true;
+  }
+  return false;
+}
+
 bool IsOnNewTab(HWND hwnd, const std::vector<std::wstring>& extra_tab_names) {
   UiaSession* session = GetUiaSession();
   if (!session) {
@@ -1411,6 +1440,189 @@ bool IsOnNewTab(HWND hwnd, const std::vector<std::wstring>& extra_tab_names) {
   }
 
   return false;
+}
+
+// keep_last_tab mode 2 only. Detects an idle new-tab page through the live
+// new-tab button name (language-agnostic for normal NTP) plus a built-in
+// common-locale fallback for incognito variants whose title is not a
+// substring of the button name. Intentionally does NOT consult
+// `new_tab_disable_name` so this detection cannot alter the bookmark / url /
+// dragdrop features that own that config.
+bool IsOnNewTabPage(HWND hwnd) {
+  UiaSession* session = GetUiaSession();
+  if (!session) {
+    return false;
+  }
+
+  RECT region_rect;
+  TabUiCache* ui = GetValidatedTabUi(session, hwnd, &region_rect);
+  if (!ui) {
+    return false;
+  }
+
+  const auto selected_tab = FindSelectedTabElement(*session, ui->container);
+  if (!selected_tab) {
+    return false;
+  }
+
+  const auto selected_name =
+      GetStringProperty(selected_tab, UIA_NamePropertyId);
+  if (!selected_name) {
+    return false;
+  }
+
+  const auto std_name = GetNewTabButtonName(*session, ui->region);
+  if (std_name && selected_name->contains(*std_name)) {
+    return true;
+  }
+
+  // Verified against Chrome's own Locales/<lang>.pak resources. Each locale
+  // contributes its new-tab title plus the incognito variant, whose title is
+  // not a substring of the new-tab button name in most languages.
+  static const std::wstring_view kKnownNtpTitles[] = {
+      L"新标签页",         L"新的无痕式标签页",  // zh-CN
+      L"新分頁",           L"新無痕分頁",        // zh-TW
+      L"New Tab",          L"New Incognito Tab",  // en-US
+      L"新しいタブ",        L"新しいシークレット タブ",  // ja
+      L"새 탭",            L"새 시크릿 탭",       // ko
+      L"Neuer Tab",        L"Neuer Inkognitotab",  // de
+      L"Nouvel onglet",    L"Nouvel onglet de navigation privée",  // fr
+      L"Nueva pestaña",    L"Nueva pestaña de Incógnito",           // es
+      L"Новая вкладка",    L"Новая вкладка инкогнито",             // ru
+  };
+  for (const auto& t : kKnownNtpTitles) {
+    if (selected_name->contains(t)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Incognito detection.
+//
+// Chromium exposes nothing incognito-specific through Win32: the class name,
+// window styles, window properties, child-window layout and the owning process
+// are all shared with regular windows, so the only observable signal is in the
+// automation tree. The "new tab" button name is NOT reliable -- it reads the
+// plain localized NTP name ("新标签页") in both window kinds. The real marker is
+// the profile / avatar toolbar button: it carries the localized incognito
+// wording only in a private window ("无痕模式", "Incognito", ...). A bounded walk of
+// the toolbar subtree reads its Name / HelpText; the selected-tab incognito NTP
+// title is a secondary fallback. Anything unrecognized falls back to false.
+bool WindowHasIncognitoMarker(HWND hwnd) {
+  UiaSession* session = GetUiaSession();
+  if (!session) {
+    return false;
+  }
+
+  const auto root = GetElementFromWindow(*session, hwnd);
+  if (!root) {
+    return false;
+  }
+
+  // Localized words Chromium uses to label the private profile. The profile /
+  // avatar toolbar button carries the localized incognito wording only in a
+  // private window (regular windows show the profile name or nothing), and the
+  // private new-tab page title carries the localized incognito wording on the
+  // selected tab. Both are kept as substrings so accent / case variants still
+  // resolve.
+  static constexpr std::array<std::wstring_view, 17> kIncognitoMarkers = {
+      L"Incognito",  L"Incógnito",
+      L"InPrivate",
+      L"无痕",        L"无痕模式",     L"無痕",
+      L"シークレット", L"시크릿",
+      L"Privato",
+      L"privado",     L"privada",
+      L"Navigation privée",
+      L"Inkognito",
+      L"инкогнито",   L"Инкогнито",
+      L"Prywatne",
+      L"비밀",
+  };
+  static constexpr std::array<std::wstring_view, 9> kIncognitoNtpTitles = {
+      L"新的无痕式标签页",
+      L"新無痕分頁",
+      L"New Incognito Tab",
+      L"新しいシークレット タブ",
+      L"새 시크릿 탭",
+      L"Neuer Inkognitotab",
+      L"Nouvel onglet de navigation privée",
+      L"Nueva pestaña de Incógnito",
+      L"Новая вкладка инкогнито",
+  };
+
+  // Primary: walk the toolbar subtree (direct children and one level deeper)
+  // and read Name + HelpText of every control. The profile / avatar button is
+  // the only one carrying the incognito wording in a private window.
+  const auto toolbar = FindShallowDescendantByClasses(
+      session->control_view_walker.Get(), root, {L"ToolbarView"},
+      /*max_visited=*/256);
+  if (toolbar) {
+    std::vector<ComPtr<IUIAutomationElement>> nodes;
+    auto append_children = [&](const ComPtr<IUIAutomationElement>& parent) {
+      ComPtr<IUIAutomationElement> child;
+      if (FAILED(session->control_view_walker->GetFirstChildElement(
+              parent.Get(), child.ReleaseAndGetAddressOf()))) {
+        return;
+      }
+      while (child) {
+        nodes.push_back(child);
+        ComPtr<IUIAutomationElement> next;
+        if (FAILED(session->control_view_walker->GetNextSiblingElement(
+                child.Get(), next.ReleaseAndGetAddressOf()))) {
+          break;
+        }
+        child = std::move(next);
+      }
+    };
+    append_children(toolbar);
+    const std::vector<ComPtr<IUIAutomationElement>> level1 = nodes;
+    for (const auto& n : level1) {
+      append_children(n);
+    }
+
+    for (const auto& node : nodes) {
+      const auto name = GetStringProperty(node, UIA_NamePropertyId);
+      const auto help = GetStringProperty(node, UIA_HelpTextPropertyId);
+      const std::wstring label =
+          (name ? *name : L"") + L" " + (help ? *help : L"");
+      for (const auto& marker : kIncognitoMarkers) {
+        if (label.find(marker) != std::wstring::npos) {
+          return true;
+        }
+      }
+    }
+  }
+
+  // Fallback: the selected tab is the incognito new-tab page.
+  RECT region_rect{};
+  TabUiCache* ui = GetValidatedTabUi(session, hwnd, &region_rect);
+  if (ui) {
+    const auto selected = FindSelectedTabElement(*session, ui->container);
+    if (selected) {
+      const auto name = GetStringProperty(selected, UIA_NamePropertyId);
+      if (name) {
+        for (const auto& t : kIncognitoNtpTitles) {
+          if (name->find(t) != std::wstring::npos) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+bool IsIncognitoWindow(HWND hwnd) {
+  if (!hwnd || !IsChromeWindow(hwnd)) {
+    return false;
+  }
+  if (const HWND root = ::GetAncestor(hwnd, GA_ROOT)) {
+    hwnd = root;
+  }
+  return WindowHasIncognitoMarker(hwnd);
 }
 
 std::optional<BookmarkBarUi> GetBookmarkBarUi(HWND hwnd) {

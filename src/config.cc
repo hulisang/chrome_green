@@ -54,6 +54,13 @@ void Config::LoadConfig() {
     }
     url_group_.push_back(std::move(value));
   }
+  open_clipboard_ = GetIniString(L"general", L"open_clipboard", L"");
+  clipboard_mode_ =
+      GetPrivateProfileIntW(L"general", L"clipboard_mode", 0,
+                            GetIniPath().c_str());
+  if (clipboard_mode_ < 0 || clipboard_mode_ > 3) {
+    clipboard_mode_ = 0;
+  }
   std::wstring theme_w = GetIniString(L"general", L"theme", L"auto");
   theme_ = std::string(theme_w.begin(), theme_w.end());
   std::wstring lang_w = GetIniString(L"general", L"language", L"auto");
@@ -81,8 +88,11 @@ void Config::LoadConfig() {
                               GetIniPath().c_str()) != 0;
 
   // tabs (ported from chrome_plus tabbookmark)
-  keep_last_tab_ = ::GetPrivateProfileIntW(L"tabs", L"keep_last_tab", 1,
-                                           GetIniPath().c_str()) != 0;
+  keep_last_tab_mode_ = ::GetPrivateProfileIntW(L"tabs", L"keep_last_tab", 1,
+                                                GetIniPath().c_str());
+  if (keep_last_tab_mode_ < 0 || keep_last_tab_mode_ > 2) {
+    keep_last_tab_mode_ = 1;
+  }
   double_click_close_ = ::GetPrivateProfileIntW(L"tabs", L"double_click_close",
                                                 1, GetIniPath().c_str()) != 0;
   right_click_close_ = ::GetPrivateProfileIntW(L"tabs", L"right_click_close", 0,
@@ -136,6 +146,21 @@ void Config::LoadConfig() {
                               GetIniPath().c_str()) != 0;
   download_source_ = ::GetPrivateProfileIntW(L"update", L"download_source", 1,
                                               GetIniPath().c_str());
+  self_update_channel_ =
+      ::GetPrivateProfileIntW(L"update", L"self_update_channel", 1,
+                              GetIniPath().c_str());
+  if (self_update_channel_ != 0 && self_update_channel_ != 2)
+    self_update_channel_ = 1;
+  graceful_close_ = ::GetPrivateProfileIntW(L"update", L"graceful_close", 1,
+                                            GetIniPath().c_str()) != 0;
+  graceful_close_timeout_ =
+      ::GetPrivateProfileIntW(L"update", L"graceful_close_timeout", 30,
+                              GetIniPath().c_str());
+  if (graceful_close_timeout_ < 5) graceful_close_timeout_ = 5;
+  if (graceful_close_timeout_ > 120) graceful_close_timeout_ = 120;
+  restore_session_after_update_ =
+      ::GetPrivateProfileIntW(L"update", L"restore_session_after_update", 1,
+                              GetIniPath().c_str()) != 0;
   // Auto-detect architecture from the running process
   update_arch_ = DetectArch();
 
@@ -246,6 +271,12 @@ open_new_window=
 ; 批量打开一组标签页的快捷键，格式同老板键；按下后按 [url_group] 列表逐个在新标签页打开
 open_url_group=
 
+; 从剪切板打开一组标签页的快捷键，格式同老板键
+open_clipboard=
+
+; 剪切板内容的处理方式。0 关闭，1 提取链接，2 文本搜索（即使是链接也按搜索处理），3 链接+文本搜索
+clipboard_mode=0
+
 ; 免验证查看已保存的密码（无需系统登录密码即可显示密码明文）。0 关闭，1 开启
 show_password=1
 
@@ -305,6 +336,17 @@ proxy_type=HTTP
 proxy_chrome_download=0
 ; 下载源：0=edgedl 1=dl.google.com(默认) 2=www.google.com 3=redirector.gvt1.com
 download_source=1
+; ChromeGreen 自身（version.dll）更新源：0 = GitHub，1 = Gitee（默认），2 = CNB
+; Gitee / CNB 通道下 GH_PROXY 代理不生效（这些镜像仅代理 GitHub）
+self_update_channel=1
+; 更新时先正常关闭 Chrome（向所有浏览器窗口发送关闭请求，等待其自然退出），
+; 超时或失败后再强制结束；可避免下次启动弹出“未正常关闭/恢复”提示。0 关闭，1 开启
+graceful_close=1
+; 等待 Chrome 自然退出的最长时间（秒，5-120）；期间“离开网站”确认框会等待用户操作
+graceful_close_timeout=30
+; 更新重启后恢复上次浏览的标签页（无视“启动时打开新标签页”设置），
+; 通过 --restore-last-session 实现；仅在正常关闭或退出标记已修正时生效。0 关闭，1 开启
+restore_session_after_update=1
 
 ; 域名映射（仅作用于 Chrome 自身，不影响系统 hosts 文件或其它程序）
 ; 通过 Chromium --host-resolver-rules 在启动参数注入，需重启 Chrome 生效
@@ -327,7 +369,7 @@ max_total=800
 
 ; 标签页增强（移植自 chrome_plus tabbookmark，在配置页“标签页增强配置”中设置）
 [tabs]
-; 保留至少一个标签页（永不关闭最后一个标签）。0 关闭，1 开启
+; 关闭最后一个标签时的行为：0=关闭浏览器窗口，1=打开一个新标签，2=如果是新标签页则关闭浏览器窗口
 keep_last_tab=1
 ; 双击标签关闭。0 关闭，1 开启
 double_click_close=1

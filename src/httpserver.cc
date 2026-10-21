@@ -182,6 +182,7 @@ std::string GetConfigJson() {
   ss << "\"proxy_type\":\"" << JsonEscape(config.GetUpdateProxyType()) << "\",";
   ss << "\"proxy_chrome_download\":" << (g_update_state.proxy_chrome_download ? "true" : "false") << ",";
   ss << "\"download_source\":" << g_update_state.download_source << ",";
+  ss << "\"self_update_channel\":" << config.GetSelfUpdateChannel() << ",";
   ss << "\"keep_installer\":" << (config.KeepInstaller() ? "true" : "false") << ",";
   ss << "\"keep_old_versions\":" << (config.KeepOldVersions() ? "true" : "false") << ",";
   ss << "\"theme\":\"" << JsonEscape(config.GetTheme()) << "\",";
@@ -206,6 +207,8 @@ std::string GetConfigJson() {
     }
     ss << "\"url_group\":\"" << JsonEscape(ug) << "\",";
   }
+  ss << "\"open_clipboard\":\"" << JsonEscape(WStringToUtf8(config.GetOpenClipboardHotkey())) << "\",";
+  ss << "\"clipboard_mode\":" << config.GetClipboardMode() << ",";
   ss << "\"win32k\":" << (config.IsWin32K() ? "true" : "false") << ",";
   ss << "\"ignore_policies\":" << (config.IsIgnorePolicies() ? "true" : "false") << ",";
   ss << "\"suppress_false_upgrade_notification\":" << (config.IsSuppressFalseUpgradeNotification() ? "true" : "false") << ",";
@@ -215,7 +218,7 @@ std::string GetConfigJson() {
   ss << "\"open_config_after_update\":" << (config.IsOpenConfigAfterUpdate() ? "true" : "false") << ",";
   ss << "\"fix_taskbar_menu\":" << (config.IsFixTaskbarMenu() ? "true" : "false") << ",";
   // --- tabs (ported from chrome_plus tabbookmark) ---
-  ss << "\"keep_last_tab\":" << (config.IsKeepLastTab() ? "true" : "false") << ",";
+  ss << "\"keep_last_tab\":" << config.GetKeepLastTabMode() << ",";
   ss << "\"double_click_close\":" << (config.IsDoubleClickClose() ? "true" : "false") << ",";
   ss << "\"right_click_close\":" << (config.IsRightClickClose() ? "true" : "false") << ",";
   ss << "\"wheel_tab\":" << (config.IsWheelTab() ? "true" : "false") << ",";
@@ -416,11 +419,13 @@ std::string HandleRequest(const HttpRequest& req) {
   // Serve the Vue3 config page
   if (req.method == "GET" && (req.path == "/" || req.path == "/config" ||
                                req.path == "/index.html")) {
-    // no-cache: the embedded page is rebuilt with each DLL update, so the
-    // browser must always revalidate (full refetch — we have no validators)
-    // instead of serving a stale heuristic-cached copy that needs Ctrl+F5.
+    // Page is rebuilt on every DLL update. no-store forbids keeping any copy,
+    // so a normal reload always refetches (no ETag/Last-Modified needed).
+    // Pragma + Expires:0 cover older clients.
     return BuildResponse(200, "text/html; charset=utf-8", GetWebContent(),
-                         "Cache-Control: no-cache\r\n");
+                         "Cache-Control: no-store, no-cache, must-revalidate\r\n"
+                         "Pragma: no-cache\r\n"
+                         "Expires: 0\r\n");
   }
 
   // API: get status
@@ -444,6 +449,9 @@ std::string HandleRequest(const HttpRequest& req) {
     std::string proxy_type = JsonGetString(req.body, "proxy_type");
     bool proxy_chrome_download = JsonGetBool(req.body, "proxy_chrome_download");
     int download_source = JsonGetInt(req.body, "download_source");
+    int self_update_channel = JsonGetInt(req.body, "self_update_channel");
+    if (self_update_channel != 0 && self_update_channel != 2)
+      self_update_channel = 1;
     bool keep_installer = JsonGetBool(req.body, "keep_installer");
     bool keep_old_versions = JsonGetBool(req.body, "keep_old_versions");
     std::string theme = JsonGetString(req.body, "theme");
@@ -461,6 +469,11 @@ std::string HandleRequest(const HttpRequest& req) {
     std::string open_new_window = JsonGetString(req.body, "open_new_window");
     std::string open_url_group = JsonGetString(req.body, "open_url_group");
     std::string url_group = JsonGetString(req.body, "url_group");
+    std::string open_clipboard = JsonGetString(req.body, "open_clipboard");
+    int clipboard_mode = JsonGetInt(req.body, "clipboard_mode");
+    if (clipboard_mode < 0 || clipboard_mode > 3) {
+      clipboard_mode = 0;
+    }
     bool win32k = JsonGetBool(req.body, "win32k");
     bool ignore_policies = JsonGetBool(req.body, "ignore_policies");
     bool suppress_false = JsonGetBool(req.body, "suppress_false_upgrade_notification");
@@ -472,7 +485,8 @@ std::string HandleRequest(const HttpRequest& req) {
     std::string key_mappings = JsonGetString(req.body, "key_mappings");
 
     // --- tabs (ported from chrome_plus tabbookmark) ---
-    bool keep_last_tab = JsonGetBool(req.body, "keep_last_tab");
+    int keep_last_tab = JsonGetInt(req.body, "keep_last_tab");
+    if (keep_last_tab < 0 || keep_last_tab > 2) keep_last_tab = 1;
     bool double_click_close = JsonGetBool(req.body, "double_click_close");
     bool right_click_close = JsonGetBool(req.body, "right_click_close");
     bool wheel_tab = JsonGetBool(req.body, "wheel_tab");
@@ -527,6 +541,8 @@ std::string HandleRequest(const HttpRequest& req) {
         proxy_chrome_download ? L"1" : L"0", GetIniPath().c_str());
     WritePrivateProfileStringW(L"update", L"download_source",
         std::to_wstring(download_source).c_str(), GetIniPath().c_str());
+    WritePrivateProfileStringW(L"update", L"self_update_channel",
+        std::to_wstring(self_update_channel).c_str(), GetIniPath().c_str());
 
     // --- general section ---
     WritePrivateProfileStringW(L"general", L"data_dir",
@@ -559,6 +575,10 @@ std::string HandleRequest(const HttpRequest& req) {
     WritePrivateProfileStringW(L"general", L"open_url_group",
         Utf8ToWstring(open_url_group).c_str(),
         GetIniPath().c_str());
+    WritePrivateProfileStringW(L"general", L"open_clipboard",
+        Utf8ToWstring(open_clipboard).c_str(), GetIniPath().c_str());
+    WritePrivateProfileStringW(L"general", L"clipboard_mode",
+        std::to_wstring(clipboard_mode).c_str(), GetIniPath().c_str());
     WritePrivateProfileStringW(L"general", L"win32k",
         win32k ? L"1" : L"0", GetIniPath().c_str());
     WritePrivateProfileStringW(L"general", L"ignore_policies",
@@ -578,7 +598,7 @@ std::string HandleRequest(const HttpRequest& req) {
 
     // --- tabs section (ported from chrome_plus tabbookmark) ---
     WritePrivateProfileStringW(L"tabs", L"keep_last_tab",
-        keep_last_tab ? L"1" : L"0", GetIniPath().c_str());
+        std::to_wstring(keep_last_tab).c_str(), GetIniPath().c_str());
     WritePrivateProfileStringW(L"tabs", L"double_click_close",
         double_click_close ? L"1" : L"0", GetIniPath().c_str());
     WritePrivateProfileStringW(L"tabs", L"right_click_close",
@@ -827,8 +847,13 @@ std::string HandleRequest(const HttpRequest& req) {
     std::thread([has_update_action]() {
       Sleep(500);
       if (has_update_action) {
-        // The update window handles restart after update 鈥?just exit
-        ExitProcess(0);
+        // The update window closes Chrome gracefully (WM_CLOSE) and waits
+        // for a natural exit - let this process end with the last window so
+        // Chrome writes exit_type=Normal (no restore bubble next launch).
+        // Hard exit remains the fallback when graceful close is disabled.
+        if (!config.IsGracefulClose()) {
+          ExitProcess(0);
+        }
       } else {
         // Normal restart: launch new Chrome, then exit this one
         wchar_t exe_path[MAX_PATH];
@@ -845,7 +870,13 @@ std::string HandleRequest(const HttpRequest& req) {
   // API: check for chrome_green self-update (Release channel only)
   if (req.method == "GET" && req.path.find("/api/self-update/check") == 0) {
     auto state = GetUpdateStateSnapshot();
-    UpdateInfo info = CheckSelfUpdate(state.proxy, state.proxy_type);
+    int self_ch = config.GetSelfUpdateChannel();
+    SelfUpdateChannel self_channel =
+        self_ch == 1 ? SelfUpdateChannel::kGitee
+                     : (self_ch == 2 ? SelfUpdateChannel::kCNB
+                                     : SelfUpdateChannel::kGitHub);
+    UpdateInfo info =
+        CheckSelfUpdate(state.proxy, state.proxy_type, self_channel);
     {
       std::lock_guard<std::mutex> lock(g_update_mutex);
       // self_latest_version always records the newest published release (for
@@ -897,11 +928,18 @@ std::string HandleRequest(const HttpRequest& req) {
     }
 
     // Download + extract in a background thread
+    int self_ch = config.GetSelfUpdateChannel();
+    SelfUpdateChannel self_channel =
+        self_ch == 1 ? SelfUpdateChannel::kGitee
+                     : (self_ch == 2 ? SelfUpdateChannel::kCNB
+                                     : SelfUpdateChannel::kGitHub);
     std::thread([url = state.self_download_url, save_path, extract_dir,
-                 proxy = state.proxy, proxy_type = state.proxy_type]() {
+                 proxy = state.proxy, proxy_type = state.proxy_type,
+                 self_channel]() {
       // Clean any previous extraction
       RemoveDirectoryRecursiveLocal(extract_dir);
-      bool ok = DownloadSelfUpdate(url, save_path, extract_dir, proxy, proxy_type);
+      bool ok = DownloadSelfUpdate(url, save_path, extract_dir, proxy,
+                                   proxy_type, self_channel);
       if (ok) {
         std::lock_guard<std::mutex> lock(g_update_mutex);
         g_update_state.self_update_ready = true;
@@ -954,10 +992,15 @@ std::string HandleRequest(const HttpRequest& req) {
     }
     SaveUpdateState();
 
-    // Exit Chrome immediately 鈥?the update window will restart it after the DLL swap
+    // The update window closes Chrome gracefully (WM_CLOSE) and restarts it
+    // after the DLL swap; let this process end with the last window so Chrome
+    // writes exit_type=Normal. Hard exit is the fallback when graceful close
+    // is disabled.
     std::thread([]() {
       Sleep(300);
-      ExitProcess(0);
+      if (!config.IsGracefulClose()) {
+        ExitProcess(0);
+      }
     }).detach();
 
     return BuildResponse(200, "application/json", "{\"ok\":true}");

@@ -23,8 +23,27 @@ bool SelectTab(const TabHitResult& hit_result);
 [[nodiscard]] bool IsOnTabBar(POINT pt);
 [[nodiscard]] bool IsOnBookmark(POINT pt);
 [[nodiscard]] bool IsOmniboxFocused();
+// True when the omnibox has no meaningful input: empty, the default
+// new-tab URL, or the localized search placeholder. Used to distinguish an
+// idle new-tab page from one where the user is mid-typing.
+[[nodiscard]] bool IsOmniboxEmptyOrDefault(HWND hwnd);
 [[nodiscard]] bool IsOnNewTab(HWND hwnd,
                               const std::vector<std::wstring>& extra_tab_names);
+// keep_last_tab mode 2 only: detects an idle new-tab page WITHOUT the shared
+// `new_tab_disable_name` config, so it cannot leak into the bookmark / url /
+// dragdrop features that own that setting.
+[[nodiscard]] bool IsOnNewTabPage(HWND hwnd);
+
+// True when `hwnd` is an incognito (off-the-record) window.
+//
+// Chromium keeps incognito state out of every Win32-visible channel - class
+// name, window styles, window properties and the owning process are all shared
+// with regular windows - so the only place it is observable is the automation
+// tree, where the profile / avatar toolbar button carries the localized
+// incognito wording ("无痕模式", "Incognito", ...) only in a private window.
+// The tab strip's "new tab" button is NOT a usable signal: it reports the plain
+// localized NTP name in both window kinds.
+[[nodiscard]] bool IsIncognitoWindow(HWND hwnd);
 
 // Screen rectangle of the tab strip, for hit tests outside a mouse-move loop
 // (resolving it per point during an OLE drag is far too costly).
