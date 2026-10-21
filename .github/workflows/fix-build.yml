@@ -80,12 +80,19 @@ jobs:
             exit 1
           fi
 
-          # The patch must survive the merge. If upstream ever ships its own
-          # equivalent the merge still succeeds (same file, different lines);
-          # this only catches the case where the fix silently disappeared.
+          # The patch must survive the merge. Upstream touching the same
+          # regions already fails the merge above, so reaching this point means
+          # a fix silently vanished (e.g. a change elsewhere in the file took
+          # the function with it). Also assert the fork's self-update channel:
+          # if it reverts to upstream's index the built dll would offer users
+          # the unpatched release.
           if ! grep -q 'SafeShellLinkSave' src/appid.cc || \
              ! grep -q 'cg_safe_lnk_save'  src/updater_gui.c; then
             echo "::error::the .lnk fix is missing after the merge"
+            exit 1
+          fi
+          if ! grep -q 'api.github.com/repos/hulisang/chrome_green/releases' src/update.cc; then
+            echo "::error::the fork self-update channel was lost in the merge (src/update.cc)"
             exit 1
           fi
 
@@ -171,9 +178,67 @@ jobs:
 
           cp "$DLL" "version-x64-${SRC_SHA}.dll"
 
+          # The version the dll reports, used as the release tag and the zip
+          # name. Read back from the binary, not from version.h, so a fork build
+          # can never be published under upstream's plain "<ver>" tag.
+          VER=$(grep -ao '2\.[0-9]*\.[0-9]*-fix' "$DLL" | head -1)
+          test -n "$VER" || { echo "::error::no '-fix' version string in the DLL"; exit 1; }
+          echo "release tag = $VER"
+          echo "RELEASE_TAG=$VER" >> "$GITHUB_ENV"
+
       - name: Upload version.dll
         uses: actions/upload-artifact@v7
         with:
           name: version-x64-${{ env.SRC_SHA }}
           path: version-x64-${{ env.SRC_SHA }}.dll
           if-no-files-found: error
+
+      # The zip nests version.dll under x64/ because that is the layout the
+      # self-updater extracts (GetCurrentArchitectureFolder).
+      - name: Package release zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pkg/x64
+          cp build/release/version.dll pkg/x64/version.dll
+          (cd pkg && 7z a -tzip -mx=9 "../ChromeGreen_v${RELEASE_TAG}.zip" x64 >/dev/null)
+          ls -l "ChromeGreen_v${RELEASE_TAG}.zip"
+
+      # One release per version: a rebuild of the same upstream version only
+      # refreshes the artifact, it does not add another release. Upstream's
+      # tags are plain "2.1.0"; this fork's are "2.1.0-fix", so the two can
+      # coexist and the self-updater resolves the fork's by tag.
+      - name: Check whether this version is already published
+        if: ${{ env.RELEASE_TAG != '' }}
+        id: tagcheck
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        if: ${{ env.RELEASE_TAG != '' && steps.tagcheck.outputs.exists == 'false' }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }}
+          files: ChromeGreen_v${{ env.RELEASE_TAG }}.zip
+          # Never a prerelease: the self-updater skips prerelease entries when
+          # picking the newest stable tag.
+          prerelease: false
+          body: |
+            Patch build of ChromeGreen ${{ env.RELEASE_TAG }}.
+
+            - upstream commit: ${{ github.sha }}
+            - built by: .github/workflows/fix-build.yml
+
+            version.dll fixes the pinned .lnk being truncated to 0 bytes
+            (crash-safe save + rollback, donor-less rebuild, read-before-write
+            skip). Unzip and replace App/version.dll.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -944,9 +944,16 @@ static int CompareSemver(const std::string& a, const std::string& b) {
 // needed. The fetch still honors the proxy config through CheckFetchTarget /
 // BuildGhProxyUrl exactly like the old paths did.
 
+// FORK: the GitHub channel resolves to hulisang/chrome_green, not upstream —
+// a fix build must never be offered the stock dll. The pre-baked index that
+// upstream uses (libsgh/ghapi-json-generator) only covers its own repos, so
+// this asks the REST API directly; ParseReleaseIndex already parses that exact
+// array shape. Unauthenticated quota is 60/h per IP, which a manual or
+// once-per-launch check never approaches. If this line disappears in an
+// upstream merge the build would silently start self-updating to stock, so the
+// sync job in .github/workflows/fix-build.yml asserts it is still here.
 static const char* kReleaseIndexBase =
-    "https://github.com/libsgh/ghapi-json-generator/raw/refs/heads/output/v2/"
-    "repos/libsgh/chrome_green/releases%3Fper_page=10/data.json";
+    "https://api.github.com/repos/hulisang/chrome_green/releases?per_page=10";
 
 // Gitee mirror of the same release payload. version.json is a small object
 // written by the release workflow:

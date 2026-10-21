@@ -146,11 +146,14 @@ void Config::LoadConfig() {
                               GetIniPath().c_str()) != 0;
   download_source_ = ::GetPrivateProfileIntW(L"update", L"download_source", 1,
                                               GetIniPath().c_str());
+  // Default 0 (GitHub), not upstream's 1 (Gitee): in this fork only the GitHub
+  // channel points at hulisang/chrome_green (see kReleaseIndexBase), so the
+  // default has to be the one that can actually deliver a fix build.
   self_update_channel_ =
-      ::GetPrivateProfileIntW(L"update", L"self_update_channel", 1,
+      ::GetPrivateProfileIntW(L"update", L"self_update_channel", 0,
                               GetIniPath().c_str());
   if (self_update_channel_ != 0 && self_update_channel_ != 2)
-    self_update_channel_ = 1;
+    self_update_channel_ = 0;
   graceful_close_ = ::GetPrivateProfileIntW(L"update", L"graceful_close", 1,
                                             GetIniPath().c_str()) != 0;
   graceful_close_timeout_ =
@@ -336,9 +339,10 @@ proxy_type=HTTP
 proxy_chrome_download=0
 ; 下载源：0=edgedl 1=dl.google.com(默认) 2=www.google.com 3=redirector.gvt1.com
 download_source=1
-; ChromeGreen 自身（version.dll）更新源：0 = GitHub，1 = Gitee（默认），2 = CNB
-; Gitee / CNB 通道下 GH_PROXY 代理不生效（这些镜像仅代理 GitHub）
-self_update_channel=1
+; ChromeGreen 自身（version.dll）更新源：0 = GitHub（默认），1 = Gitee，2 = CNB
+; 本 fork 只有 GitHub 通道指向 hulisang/chrome_green；Gitee / CNB 仍是上游镜像，
+; 选它们会更新回未打补丁的官方版本。GH_PROXY 对 Gitee / CNB 不生效。
+self_update_channel=0
 ; 更新时先正常关闭 Chrome（向所有浏览器窗口发送关闭请求，等待其自然退出），
 ; 超时或失败后再强制结束；可避免下次启动弹出“未正常关闭/恢复”提示。0 关闭，1 开启
 graceful_close=1

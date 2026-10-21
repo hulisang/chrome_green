@@ -450,8 +450,9 @@ std::string HandleRequest(const HttpRequest& req) {
     bool proxy_chrome_download = JsonGetBool(req.body, "proxy_chrome_download");
     int download_source = JsonGetInt(req.body, "download_source");
     int self_update_channel = JsonGetInt(req.body, "self_update_channel");
+    // Fork default is 0 (GitHub) — the only channel pointing at this fork.
     if (self_update_channel != 0 && self_update_channel != 2)
-      self_update_channel = 1;
+      self_update_channel = 0;
     bool keep_installer = JsonGetBool(req.body, "keep_installer");
     bool keep_old_versions = JsonGetBool(req.body, "keep_old_versions");
     std::string theme = JsonGetString(req.body, "theme");
