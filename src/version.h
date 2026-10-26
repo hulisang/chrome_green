@@ -3,12 +3,12 @@
 
 #define RELEASE_VER_MAIN 2
 #define RELEASE_VER_SUB 1
-#define RELEASE_VER_FIX 0
+#define RELEASE_VER_FIX 2
 // FORK: the build identifies itself as "<version>-fix" and releases are tagged
 // "<version>-fix". Upstream's numbers are reused as-is (the branch merges
-// upstream), so "2.1.0-fix" -> "2.1.1-fix" compares purely on the numbers,
-// while the suffix keeps a fix install distinguishable from stock 2.1.0 in the
-// UI, the zip name and the release tag.
+// upstream), so "2.1.2-fix" compares purely on the numbers, while the suffix
+// keeps a fix install distinguishable from stock 2.1.2 in the UI, the zip name
+// and the release tag.
 #define RELEASE_VER_PRE_SUFFIX "-fix"
 
 #define TOSTRING2(arg) #arg
