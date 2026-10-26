@@ -75,9 +75,55 @@ jobs:
           git checkout -B "$TARGET" "$TIP"
           if ! git merge --no-ff --no-edit \
                -m "chore(sync): merge ${UPSTREAM} main@${UP:0:7} into ${TARGET}" "$UP"; then
-            echo "::error::Merge conflict against upstream ${UP:0:7} — the fix needs a manual rebase (src/appid.cc / src/updater_gui.c)."
-            git merge --abort
-            exit 1
+            CONFLICTS=$(git diff --name-only --diff-filter=U)
+            # src/version.h collides on EVERY upstream version bump: upstream
+            # rewrites the RELEASE_VER_* numbers, the fork owns the "-fix"
+            # suffix on the adjacent line plus a comment block. The two intents
+            # compose, so resolve this one mechanically — take upstream's
+            # numbers, keep the fork's suffix — instead of failing the run.
+            # Any other conflicted file is a real semantic conflict and stops
+            # here with the actual list.
+            if [ "$CONFLICTS" != "src/version.h" ]; then
+              echo "::error::Merge conflict against upstream ${UP:0:7} in: $(echo "$CONFLICTS" | tr '\n' ' ')— needs a manual rebase."
+              git merge --abort
+              exit 1
+            fi
+            echo "resolving the src/version.h number/suffix collision"
+            git checkout --ours -- src/version.h   # keep the fork's "-fix" suffix
+            for k in MAIN SUB FIX; do
+              v=$(git show "$UP:src/version.h" \
+                    | sed -n "s/^#define RELEASE_VER_${k} \([0-9][0-9]*\).*/\1/p")
+              if [ -z "$v" ]; then
+                echo "::error::upstream ${UP:0:7} no longer defines RELEASE_VER_${k}; src/version.h needs a manual rebase."
+                git merge --abort
+                exit 1
+              fi
+              sed -i "s/^#define RELEASE_VER_${k} [0-9][0-9]*/#define RELEASE_VER_${k} ${v}/" src/version.h
+            done
+            if ! grep -q '^#define RELEASE_VER_PRE_SUFFIX "-fix"' src/version.h; then
+              echo "::error::the '-fix' suffix is missing after resolving src/version.h"
+              git merge --abort
+              exit 1
+            fi
+            if grep -qE '^(<<<<<<<|=======|>>>>>>>)' src/version.h; then
+              echo "::error::src/version.h still has conflict markers after resolution"
+              git merge --abort
+              exit 1
+            fi
+            # Anything upstream touched in that file besides the four defines
+            # would be dropped by the resolution above; refuse instead.
+            EXTRA=$(git show "$UP:src/version.h" \
+                      | grep -vE '^#define RELEASE_VER_(MAIN|SUB|FIX|PRE_SUFFIX) ' \
+                      | grep -v '^$' \
+                      | grep -vxF -f src/version.h || true)
+            if [ -n "$EXTRA" ]; then
+              echo "::error::upstream ${UP:0:7} changed more than the version numbers in src/version.h; needs a manual rebase."
+              git merge --abort
+              exit 1
+            fi
+            git add src/version.h
+            # --no-edit reuses MERGE_MSG written by the failed merge above.
+            git commit --no-edit -q
           fi
 
           # The patch must survive the merge. Upstream touching the same
