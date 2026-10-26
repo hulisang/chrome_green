@@ -168,7 +168,20 @@ jobs:
           grep -E '#define RELEASE_VER' src/version.h
           echo "fix markers appid  : $(grep -c 'SafeShellLinkSave\|HealTruncatedLnks' src/appid.cc)"
           echo "fix markers updater: $(grep -c 'cg_safe_lnk_save\|cg_heal_truncated' src/updater_gui.c)"
+          # On a schedule/dispatch run github.sha is the default branch, and on
+          # a push it is already the fix tip; either way it is NOT the upstream
+          # commit. Take the upstream side of the newest sync merge so the
+          # release notes name the right base and the tag points at the code
+          # that actually produced the dll.
+          BUILT=$(git rev-parse HEAD)
+          UP=$(git log --merges --fixed-strings \
+                     --grep='chore(sync): merge' -1 --format='%P' "$BUILT" \
+                | awk '{print $2}')
+          echo "built commit : $BUILT"
+          echo "upstream base: ${UP:-unknown}"
           echo "SRC_SHA=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILT_SHA=$BUILT" >> "$GITHUB_ENV"
+          echo "UPSTREAM_SHA=${UP:-unknown}" >> "$GITHUB_ENV"
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -250,10 +263,13 @@ jobs:
           (cd pkg && 7z a -tzip -mx=9 "../ChromeGreen_v${RELEASE_TAG}.zip" x64 >/dev/null)
           ls -l "ChromeGreen_v${RELEASE_TAG}.zip"
 
-      # One release per version: a rebuild of the same upstream version only
-      # refreshes the artifact, it does not add another release. Upstream's
-      # tags are plain "2.1.0"; this fork's are "2.1.0-fix", so the two can
-      # coexist and the self-updater resolves the fork's by tag.
+      # One release per version. A rebuild of an already published version
+      # leaves that release untouched: the self-updater compares version
+      # numbers, so nobody holding 2.1.2-fix would ever re-fetch the asset, and
+      # swapping the file under the same tag would only make the download
+      # disagree with itself. A fix that must reach existing installs needs a
+      # version bump. Upstream's tags are plain "2.1.0"; this fork's are
+      # "2.1.0-fix", so the two coexist and the updater resolves the fork's.
       - name: Check whether this version is already published
         if: ${{ env.RELEASE_TAG != '' }}
         id: tagcheck
@@ -273,6 +289,10 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
+          # The tag must point at the commit that was just built. Without this
+          # the action uses the ref of the triggering event, so a scheduled run
+          # from main tags main — a commit with no dll in it.
+          target_commitish: ${{ env.BUILT_SHA }}
           files: ChromeGreen_v${{ env.RELEASE_TAG }}.zip
           # Never a prerelease: the self-updater skips prerelease entries when
           # picking the newest stable tag.
@@ -280,7 +300,8 @@ jobs:
           body: |
             Patch build of ChromeGreen ${{ env.RELEASE_TAG }}.
 
-            - upstream commit: ${{ github.sha }}
+            - upstream commit: ${{ env.UPSTREAM_SHA }}
+            - built from: ${{ env.BUILT_SHA }}
             - built by: .github/workflows/fix-build.yml
 
             version.dll fixes the pinned .lnk being truncated to 0 bytes
